@@ -65,6 +65,17 @@ class RenderConfig:
 
 
 @dataclass
+class SessionConfig:
+    # 描画したページを PC 側で保持し、JS で動く UI（開閉・タブ・メニューなど）の操作を中継する
+    enabled: bool = True
+    max_sessions: int = 3  # 同時に保持するページの数（1 ページで 100〜300MB 程度のメモリを使う）
+    idle_minutes: int = 10  # 操作がないまま経過したら破棄するまでの時間
+    settle_ms: int = 3000  # 操作後、ページの変化が落ち着くまで待つ上限
+    quiet_ms: int = 250  # この時間 DOM の変化が途切れたら落ち着いたとみなす
+    tap_timeout_ms: int = 2000  # 要素がタップできる状態になるまで待つ上限
+
+
+@dataclass
 class ImageConfig:
     default_quality: str = "mid"  # 画質を選んでいないときの既定（low / mid / high / orig）
     precompute: bool = True  # 描画時に既定の画質へ変換し、画像の枠にサイズを表示する
@@ -119,6 +130,7 @@ class Config:
     access: AccessConfig = field(default_factory=AccessConfig)
     browser: BrowserConfig = field(default_factory=BrowserConfig)
     render: RenderConfig = field(default_factory=RenderConfig)
+    session: SessionConfig = field(default_factory=SessionConfig)
     image: ImageConfig = field(default_factory=ImageConfig)
     network: NetworkConfig = field(default_factory=NetworkConfig)
     search: SearchConfig = field(default_factory=SearchConfig)
@@ -130,6 +142,7 @@ _SECTIONS = {
     "access": AccessConfig,
     "browser": BrowserConfig,
     "render": RenderConfig,
+    "session": SessionConfig,
     "image": ImageConfig,
     "network": NetworkConfig,
     "search": SearchConfig,

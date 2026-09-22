@@ -11,7 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 
-from liteproxy.browser import NonHtml, RenderError, Snapshot, Viewport
+from liteproxy.browser import ActResult, NonHtml, RenderError, Snapshot, Viewport
 from liteproxy.config import Config
 from liteproxy.main import CLIENT_SRC, create_app, viewport_from_cookie
 
@@ -29,10 +29,16 @@ SNAPSHOT = Snapshot(
 
 
 class FakeRenderer:
-    def __init__(self, result=SNAPSHOT, *, delay=0.0):
+    def __init__(self, result=SNAPSHOT, *, delay=0.0, act_result=None):
         self.result = result
         self.delay = delay
         self.calls = []
+        self.act_result = act_result or ActResult("expired")
+        self.act_calls = []
+
+    async def act(self, session_id, rev, path, image_quality=None):
+        self.act_calls.append((session_id, rev, path))
+        return self.act_result
 
     async def start(self):
         pass
@@ -116,7 +122,7 @@ def test_loader_then_result_with_phone_viewport():
     assert res.headers["cache-control"] == "private, max-age=300"
     assert "content-language" not in res.headers  # 中継したページは元の言語に任せる
     nonce = res.headers["content-security-policy"].split("'nonce-")[1].split("'")[0]
-    assert f'<script nonce="{nonce}">' in res.text
+    assert f'<script nonce="{nonce}" data-lp-x>' in res.text
 
 
 def test_loader_reports_each_stage():
@@ -170,7 +176,7 @@ def test_toolbar_passes_image_settings_to_client():
         js = client.get(CLIENT_SRC)
     assert 'data-page="https://8.8.8.8/final"' in res.text
     assert 'data-dq="mid"' in res.text and 'id="lp-img"' in res.text
-    assert f'<script src="{CLIENT_SRC}" defer></script>' in res.text
+    assert f'<script src="{CLIENT_SRC}" defer data-lp-x></script>' in res.text
     assert "img-src 'self' data:" in res.headers["content-security-policy"]
     assert js.headers["content-type"].startswith("text/javascript")
     assert "immutable" in js.headers["cache-control"]
@@ -231,6 +237,70 @@ def test_image_endpoint_serves_converted_image(image_server):
 def test_image_endpoint_rejects_private_address(image_server):
     with make_client() as client:
         assert client.get("/i", params={"u": image_server + "/a.png"}).status_code == 403
+
+
+def test_force_rerenders_even_with_recent_result():
+    renderer = FakeRenderer()
+    with make_client(renderer) as client:
+        open_page(client, "https://8.8.8.8/")
+        res = client.get("/p", params={"u": "https://8.8.8.8/", "f": "1"})
+    assert "PCで処理しています" in res.text
+    assert len(renderer.calls) == 2
+
+
+ACT = {"s": "sess", "r": 3, "p": [1, 0, 2]}
+LP = {"X-LP": "1"}
+
+
+def test_act_requires_custom_header():
+    renderer = FakeRenderer()
+    with make_client(renderer) as client:
+        res = client.post("/a", json=ACT)
+    assert res.status_code == 403 and renderer.act_calls == []
+
+
+@pytest.mark.parametrize("body", [{}, {"s": "x", "r": "1", "p": []}, {"s": "x", "r": 1, "p": ["a"]},
+                                  {"s": "x", "r": 1, "p": [-1]}, {"s": "x" * 100, "r": 1, "p": []}])
+def test_act_rejects_malformed_body(body):
+    with make_client() as client:
+        assert client.post("/a", json=body, headers=LP).status_code == 400
+
+
+def test_act_returns_diff():
+    result = ActResult("ok", rev=4, ops=[{"t": "a", "p": [1], "a": {"class": "x"}}], css=[".x{color:red}"])
+    renderer = FakeRenderer(act_result=result)
+    with make_client(renderer) as client:
+        res = client.post("/a", json=ACT, headers=LP)
+    assert res.json() == {"r": 4, "ops": result.ops, "css": result.css}
+    assert renderer.act_calls == [("sess", 3, [1, 0, 2])]
+
+
+@pytest.mark.parametrize("status", ["expired", "reload"])
+def test_act_tells_client_to_reload(status):
+    with make_client(FakeRenderer(act_result=ActResult(status))) as client:
+        assert client.post("/a", json=ACT, headers=LP).json() == {status: True}
+
+
+def test_act_navigation_is_served_from_view():
+    moved = Snapshot(**{**SNAPSHOT.__dict__, "url": "https://8.8.8.8/next", "title": "次のページ"})
+    renderer = FakeRenderer(act_result=ActResult("navigated", rev=5, snapshot=moved))
+    with make_client(renderer) as client:
+        nav = client.post("/a", json=ACT, headers=LP).json()["nav"]
+        res = client.get(nav)
+    assert nav.startswith("/v?u=" + quote("https://8.8.8.8/next", safe=""))
+    assert "次のページ" in res.text and len(renderer.calls) == 0  # 描画し直さずに遷移先を表示する
+
+
+def test_act_popup_opens_through_proxy():
+    renderer = FakeRenderer(act_result=ActResult("popup", url="https://8.8.8.8/tab"))
+    with make_client(renderer) as client:
+        assert client.post("/a", json=ACT, headers=LP).json() == {"nav": "/p?u=" + quote("https://8.8.8.8/tab", safe="")}
+
+
+def test_csp_allows_only_same_origin_requests():
+    with make_client() as client:
+        csp = client.get("/").headers["content-security-policy"]
+    assert "connect-src 'self'" in csp
 
 
 def test_get_form_is_forwarded():

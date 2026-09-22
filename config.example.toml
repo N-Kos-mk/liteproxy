@@ -41,6 +41,15 @@ remove_selectors = [
   ".qc-cmp2-container",
 ]
 
+[session]
+# 描画したページを PC 側で保持し、JS で動く UI（開閉・タブ・メニューなど）の操作を中継する
+enabled = true
+max_sessions = 3     # 同時に保持するページの数（1 ページで 100〜300MB 程度のメモリを使う）
+idle_minutes = 10    # 操作がないまま経過したら破棄するまでの時間
+settle_ms = 3000     # 操作後、ページの変化が落ち着くまで待つ上限
+quiet_ms = 250       # この時間 DOM の変化が途切れたら落ち着いたとみなす
+tap_timeout_ms = 2000  # 要素がタップできる状態になるまで待つ上限
+
 [image]
 # 画像はタップしたときだけ読み込む。画質: low（長辺 320px）/ mid（640px）/ high（画面の実ピクセル幅）/ orig（原本）
 default_quality = "mid"  # スマホ側で画質を選んでいないときの既定

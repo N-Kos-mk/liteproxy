@@ -13,7 +13,14 @@ from urllib.parse import quote, quote_plus
 import jwt
 from fastapi import FastAPI, Request
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response, StreamingResponse
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+    Response,
+    StreamingResponse,
+)
 from starlette.concurrency import run_in_threadpool
 
 from . import templates
@@ -39,7 +46,7 @@ log = logging.getLogger(__name__)
 # 読み込めるのは liteproxy 自身の画像（/i）と JS（/static）だけにする
 _CSP = (
     "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; script-src 'self' 'nonce-{nonce}'; "
-    "frame-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+    "connect-src 'self'; frame-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
 )
 # /i は取得した画像をそのまま返すことがあるため、SVG 内のスクリプトなどが動かないようにする
 _IMAGE_CSP = "default-src 'none'; style-src 'unsafe-inline'; sandbox"
@@ -122,7 +129,7 @@ def create_app(
     guard = HostGuard(allow_private=config.network.allow_private, block_domains=config.network.block_domains)
     mb = 1024 * 1024
     images = ImageStore(guard, cache_bytes=config.image.cache_mb * mb, max_image_bytes=config.image.max_image_mb * mb)
-    pool: Renderer = renderer or BrowserPool(config.browser, config.render, guard, images)
+    pool: Renderer = renderer or BrowserPool(config.browser, config.render, guard, images, config.session)
     default_quality = config.image.default_quality
     stats_log = StatsLog(config.log.stats_file)
     if verifier is None and config.access.enabled:
@@ -236,7 +243,8 @@ def create_app(
         return RedirectResponse(proxy_url(target), status_code=303)
 
     @app.get("/p")
-    async def proxy(request: Request, u: str = "") -> Response:
+    async def proxy(request: Request, u: str = "", f: str = "") -> Response:
+        """f=1 なら保持している結果を使わずに描画し直す（PC 側のページが失われた場合など）。"""
         nonce = secrets.token_urlsafe(12)
         target = normalize_input(u)
         if target is None:
@@ -249,12 +257,13 @@ def create_app(
             return html_response(templates.error_page(message, nonce), nonce=nonce, status=403)
 
         key = render_key(request, target)
-        cached = jobs.cached(key)
+        force = f == "1"
+        cached = None if force else jobs.cached(key)
         if cached is not None:
             return result_response(cached)
         # 描画を待たずに読み込み中画面を返し、進捗を流し続ける。完了したら /v へ移動させる。
         # no-transform は Cloudflare に圧縮・加工させず、進捗をため込まずに届けるため
-        job = jobs.start(key)
+        job = jobs.start(key, force=force)
         return StreamingResponse(
             loader_stream(job, target, nonce),
             media_type="text/html",
@@ -274,6 +283,42 @@ def create_app(
         if result is None:
             return RedirectResponse(proxy_url(target), status_code=303)
         return result_response(result)
+
+    @app.post("/a")
+    async def act(request: Request) -> Response:
+        """スマホでタップされた JS の UI を PC 側で操作し、画面の差分を返す。"""
+        # 独自ヘッダーを必須にし、他のサイトからのフォーム送信などで操作されないようにする
+        if request.headers.get("x-lp") != "1":
+            return PlainTextResponse("Forbidden", status_code=403)
+        try:
+            body = await request.json()
+            session_id, rev, path = body["s"], body["r"], body["p"]
+            valid = (
+                isinstance(session_id, str)
+                and len(session_id) <= 64
+                and isinstance(rev, int)
+                and isinstance(path, list)
+                and len(path) <= 256
+                and all(isinstance(i, int) and 0 <= i < 100_000 for i in path)
+            )
+        except (ValueError, KeyError, TypeError):
+            valid = False
+        if not valid:
+            return JSONResponse({"error": "要求の形式が不正です。"}, status_code=400)
+
+        quality = image_quality(request) if config.image.precompute else None
+        result = await pool.act(session_id, rev, path, image_quality=quality)
+        if result.status in ("expired", "reload"):
+            return JSONResponse({result.status: True})
+        if result.status == "error":
+            return JSONResponse({"error": result.message})
+        if result.status == "popup" and result.url:
+            return JSONResponse({"nav": proxy_url(result.url)})
+        if result.status == "navigated" and result.snapshot is not None:
+            snap = result.snapshot
+            job = jobs.put(render_key(request, snap.url), snap)
+            return JSONResponse({"nav": view_url(snap.url, job.id)})
+        return JSONResponse({"r": result.rev, "ops": result.ops, "css": result.css})
 
     @app.get("/f")
     async def form_get(request: Request) -> Response:

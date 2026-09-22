@@ -21,8 +21,13 @@ def finalize(snap: Snapshot, nonce: str, *, default_quality: str, client_src: st
         sized_quality=snap.image_quality,
         default_quality=default_quality,
         client_src=client_src,
+        session_id=snap.session_id,
+        rev=snap.rev,
     )
-    html = snap.html.replace("<!--lp-bar-->", bar, 1).replace("</head>", f"<style>{BAR_CSS}</style></head>", 1)
+    # liteproxy が足す要素には data-lp-x を付け、操作の差分で要素の位置を数えるときに除く
+    html = snap.html.replace("<!--lp-bar-->", bar, 1).replace(
+        "</head>", f"<style data-lp-x>{BAR_CSS}</style></head>", 1
+    )
     stats = PageStats(
         url=snap.url,
         elapsed_ms=snap.elapsed_ms,

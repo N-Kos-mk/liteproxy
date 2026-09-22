@@ -35,8 +35,8 @@ BAR_CSS = (
 )
 
 
-def env_script(nonce: str) -> str:
-    return f'<script nonce="{nonce}">{_ENV_SCRIPT}</script>'
+def env_script(nonce: str, *, own: bool = False) -> str:
+    return f'<script nonce="{nonce}"{" data-lp-x" if own else ""}>{_ENV_SCRIPT}</script>'
 
 
 def _page(title: str, body: str, nonce: str) -> str:
@@ -162,13 +162,20 @@ def toolbar(
     sized_quality: str | None,
     default_quality: str,
     client_src: str,
+    session_id: str | None = None,
+    rev: int = 0,
 ) -> str:
-    """sized_quality は画像の枠に表示したサイズの画質。client.js が読み込み時の画質の判断に使う。"""
+    """client.js へ渡す情報を属性に持たせる。
+
+    sized_quality は画像の枠に表示したサイズの画質、session_id と rev は操作を中継するための
+    PC 側のページと HTML の版。liteproxy が足す script には data-lp-x を付け、差分の位置の数え方から外す。
+    """
     return (
         f'<lp-bar data-page="{escape(url)}" data-q="{escape(sized_quality or "")}" '
-        f'data-dq="{escape(default_quality)}"><a href="/"><b>LP</b></a><span class="t">{escape(title)}</span>'
+        f'data-dq="{escape(default_quality)}" data-s="{escape(session_id or "")}" data-r="{rev}">'
+        f'<a href="/"><b>LP</b></a><span class="t">{escape(title)}</span>'
         f'<span title="送信量（圧縮後の目安） / PC 側の取得量">{escape(sent)} / {escape(fetched)}</span>'
         '<button type="button" id="lp-img" title="画像の読み込みと画質の設定">画像</button>'
         f'<a href="{escape(url)}" rel="noreferrer" title="元のページを直接開く（通信量に注意）">元</a>'
-        f'</lp-bar>{env_script(nonce)}<script src="{escape(client_src)}" defer></script>'
+        f'</lp-bar>{env_script(nonce, own=True)}<script src="{escape(client_src)}" defer data-lp-x></script>'
     )

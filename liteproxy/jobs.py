@@ -15,7 +15,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
-from .browser import STAGE_QUEUED, NonHtml, RenderError, Snapshot, StageCallback, Viewport
+from .browser import STAGE_QUEUED, ActResult, NonHtml, RenderError, Snapshot, StageCallback, Viewport
 
 log = logging.getLogger(__name__)
 
@@ -31,6 +31,9 @@ class Renderer(Protocol):
         on_stage: StageCallback | None = None,
         image_quality: str | None = None,
     ) -> Snapshot | NonHtml: ...
+    async def act(
+        self, session_id: str, rev: int, path: list[int], image_quality: str | None = None
+    ) -> ActResult: ...
 
 
 @dataclass(frozen=True)
@@ -121,15 +124,29 @@ class RenderJobs:
             return job.result
         return None
 
-    def start(self, key: RenderKey) -> Job:
-        """同じ条件の描画が進行中、または有効な結果があればそのジョブを返し、なければ新たに始める。"""
+    def start(self, key: RenderKey, *, force: bool = False) -> Job:
+        """同じ条件の描画が進行中、または有効な結果があればそのジョブを返し、なければ新たに始める。
+
+        force なら有効な結果があっても描画し直す（進行中の描画は使う）。
+        """
         current = self._by_key.get(key)
-        if current is not None and current.error is None and (not current.done or self._fresh(current)):
-            return current
+        if current is not None and current.error is None:
+            if not current.done or (not force and self._fresh(current)):
+                return current
         job = Job(key)
         self._jobs[job.id] = job
         self._by_key[key] = job
         job.task = asyncio.create_task(self._run(job))
+        return job
+
+    def put(self, key: RenderKey, result: Snapshot | NonHtml) -> Job:
+        """描画以外で得た結果（操作による画面遷移の遷移先など）を完了済みのジョブとして登録する。"""
+        job = Job(key)
+        sent = self._on_complete(job, result) if self._on_complete else None
+        job.finish(result, sent)
+        self._jobs[job.id] = job
+        self._by_key[key] = job
+        self._prune()
         return job
 
     async def aclose(self) -> None:
