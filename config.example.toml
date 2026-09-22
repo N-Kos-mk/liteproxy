@@ -1,0 +1,89 @@
+# liteproxy の設定例。config.toml にコピーして使う。
+# 書かなかった項目は既定値（この例と同じ値）になる。
+
+[server]
+# cloudflared からのみ到達させるため、ループバックだけで待ち受ける
+host = "127.0.0.1"
+port = 8700
+
+[access]
+# Cloudflare Access が付与する JWT をアプリ側でも検証する。外部公開時は true にする
+enabled = false
+team_domain = ""       # 例: yourteam.cloudflareaccess.com
+aud = ""               # Access アプリケーションの Audience (AUD) タグ
+allowed_emails = []    # 空なら Access のポリシーに任せる
+
+[browser]
+channel = "chrome"     # インストール済みの Chrome を使う。"" なら Playwright 同梱の Chromium
+max_concurrency = 2
+nav_timeout_ms = 20000     # HTML の読み込み（DOMContentLoaded）までの上限
+settle_timeout_ms = 5000   # その後、JS・CSS・XHR の通信が落ち着くまで待つ上限
+quiet_ms = 400             # この時間通信が途切れたら落ち着いたとみなす
+scroll_max_steps = 15
+scroll_delay_ms = 120
+image_wait_ms = 1500       # スクロール後、寸法の分からない画像を待つ上限
+# スマホから画面情報の Cookie が届く前に使う既定値
+default_width = 390
+default_height = 844
+default_dpr = 3.0
+
+[render]
+max_inline_svg = 3000  # これより大きいインライン SVG は中身を捨てて枠だけ残す
+max_data_uri = 2048    # これ以下の data: URI（小さなアイコン等）はそのまま残す
+prune_classes = true   # CSS から参照されない class 名を削る
+# 描画結果から取り除く要素（JS なしでは閉じられない Cookie 同意バナーなど）
+remove_selectors = [
+  "#onetrust-consent-sdk",
+  "#CybotCookiebotDialog",
+  "#didomi-host",
+  ".fc-consent-root",
+  "#usercentrics-root",
+  ".qc-cmp2-container",
+]
+
+[session]
+# 描画したページを PC 側で保持し、JS で動く UI（開閉・タブ・メニューなど）の操作を中継する
+enabled = true
+max_sessions = 3     # 同時に保持するページの数（1 ページで 100〜300MB 程度のメモリを使う）
+idle_minutes = 10    # 操作がないまま経過したら破棄するまでの時間
+settle_ms = 3000     # 操作後、ページの変化が落ち着くまで待つ上限
+quiet_ms = 250       # この時間 DOM の変化が途切れたら落ち着いたとみなす
+tap_timeout_ms = 2000  # 要素がタップできる状態になるまで待つ上限
+
+[image]
+# 画像はタップしたときだけ読み込む。画質: low（長辺 320px）/ mid（640px）/ high（画面の実ピクセル幅）/ orig（原本）
+default_quality = "mid"  # スマホ側で画質を選んでいないときの既定
+precompute = true        # 描画時に既定の画質へ変換し、画像の枠にサイズを表示する
+cache_mb = 256           # 元画像と変換結果を保持するメモリの上限
+max_image_mb = 20        # 1 枚あたりの取得上限
+
+[network]
+allow_private = false  # true にすると LAN・ループバック宛ての取得を許可する（テスト用）
+# PC 側での取得自体を止めるドメイン（サブドメインを含む）
+block_domains = [
+  "doubleclick.net",
+  "googlesyndication.com",
+  "googleadservices.com",
+  "googletagservices.com",
+  "adservice.google.com",
+  "amazon-adsystem.com",
+  "criteo.com",
+  "criteo.net",
+  "taboola.com",
+  "outbrain.com",
+  "adnxs.com",
+  "rubiconproject.com",
+  "pubmatic.com",
+  "scorecardresearch.com",
+  "i-mobile.co.jp",
+  "microad.jp",
+  "cdn.cookielaw.org",
+  "consent.cookiebot.com",
+]
+
+[search]
+url = "https://html.duckduckgo.com/html/?q={q}"
+
+[log]
+file = "logs/liteproxy.log"      # 動作ログ（1MB ごとに切り替え、3 世代まで保持）。"" なら出力しない
+stats_file = "logs/stats.jsonl"  # ページごとの転送量の記録。"" なら記録しない
