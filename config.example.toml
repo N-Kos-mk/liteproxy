@@ -69,4 +69,5 @@ block_domains = [
 url = "https://html.duckduckgo.com/html/?q={q}"
 
 [log]
+file = "logs/liteproxy.log"      # 動作ログ（1MB ごとに切り替え、3 世代まで保持）。"" なら出力しない
 stats_file = "logs/stats.jsonl"  # ページごとの転送量の記録。"" なら記録しない

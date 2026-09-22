@@ -101,6 +101,7 @@ class SearchConfig:
 
 @dataclass
 class LogConfig:
+    file: str = "logs/liteproxy.log"  # 動作ログ（1MB ごとに切り替え、3 世代まで保持）。空文字なら出力しない
     stats_file: str = "logs/stats.jsonl"  # 空文字なら記録しない
 
 
