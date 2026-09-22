@@ -306,14 +306,31 @@
 
   let queue = Promise.resolve();
 
-  function forward(el) {
+  function forward(el, payload) {
     const path = pathOf(el);
     if (!path) return;
     el.setAttribute('data-lp-busy', '');
-    queue = queue.then(() => act(path, el)).finally(() => el.removeAttribute('data-lp-busy'));
+    // 版番号は送る直前に読む（前の操作の結果で変わるため）
+    queue = queue.then(() => act({ p: path, ...payload }, el)).finally(() => el.removeAttribute('data-lp-busy'));
   }
 
-  async function act(path, el) {
+  // POST の送信は、PC 側のページのフォームへ値を入れて送ってもらう。
+  // Cookie やフォームに埋め込まれたトークン、送信時に動く JS をそのまま使える
+  function submitForm(form, submitter) {
+    let data;
+    try {
+      data = new FormData(form, submitter);
+    } catch {
+      data = new FormData(form);
+    }
+    const fields = [];
+    for (const [name, value] of data.entries()) {
+      if (typeof value === 'string' && !name.startsWith('__lp_')) fields.push([name, value]);
+    }
+    forward(form, { k: 'submit', v: fields, b: submitter ? pathOf(submitter) : null });
+  }
+
+  async function act(body, el) {
     const started = Date.now();
     const tick = setInterval(() => status(`PCで操作中… ${((Date.now() - started) / 1000).toFixed(1)}秒`), 200);
     status('PCで操作中…');
@@ -321,7 +338,7 @@
       const res = await fetch('/a', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-LP': '1' },
-        body: JSON.stringify({ s: session, r: rev, p: path }),
+        body: JSON.stringify({ s: session, r: rev, ...body }),
       });
       const data = await res.json();
       if (data.nav) {
@@ -386,6 +403,17 @@
         e.stopPropagation();
       }
       forward(target);
+    },
+    true,
+  );
+
+  document.addEventListener(
+    'submit',
+    (e) => {
+      const form = e.target;
+      if (!session || !(form instanceof HTMLFormElement) || !form.hasAttribute('data-lp-post')) return;
+      e.preventDefault();
+      submitForm(form, e.submitter);
     },
     true,
   );

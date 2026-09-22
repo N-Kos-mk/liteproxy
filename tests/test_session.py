@@ -27,7 +27,7 @@ def site(tmp_path_factory):
     server.shutdown()
 
 
-def run(site: str, scenario, *, sessions: SessionConfig | None = None):
+def run(site: str, scenario, *, page: str = "/page.html", sessions: SessionConfig | None = None):
     """ページを描画してセッションを作り、scenario(pool, snap, path_of) を実行する。"""
 
     async def main():
@@ -43,7 +43,7 @@ def run(site: str, scenario, *, sessions: SessionConfig | None = None):
         except Exception as e:  # noqa: BLE001
             pytest.skip(f"ブラウザを起動できません: {e}")
         try:
-            snap = await pool.render(site + "/page.html", Viewport(390, 844, 2, False), None)
+            snap = await pool.render(site + page, Viewport(390, 844, 2, False), None)
             assert isinstance(snap, Snapshot) and snap.session_id
 
             async def path_of(selector: str) -> list[int]:
@@ -155,3 +155,34 @@ def test_unknown_or_evicted_session_is_expired(site):
 
     unknown, evicted = run(site, scenario, sessions=SessionConfig(max_sessions=1))
     assert unknown.status == "expired" and evicted.status == "expired"
+
+
+def echoed(html: str) -> str:
+    m = re.search(r'<p id="got">([^<]*)</p>', html)
+    assert m, "送信内容を表示するページになっていない"
+    return m.group(1)
+
+
+def test_post_form_is_submitted_from_the_pc_page(site):
+    async def scenario(pool, snap, path_of):
+        # hidden の token はスマホ側の HTML にも含まれる。PC 側のフォームへ入れ直して送信する
+        fields = [["q", "入力値"], ["token", "t0ken"], ["memo", "めも"], ["opt", "1"], ["sel", "b"], ["btn", "go"]]
+        return await pool.act(
+            snap.session_id, snap.rev, await path_of("#f"),
+            kind="submit", fields=fields, submitter=await path_of("#send"),
+        )
+
+    result = run(site, scenario, page="/form.html")
+    assert result.status == "navigated"
+    assert echoed(result.snapshot.html) == "btn=go;memo=めも;opt=1;q=入力値;sel=b;token=t0ken"
+
+
+def test_post_form_without_submit_button(site):
+    async def scenario(pool, snap, path_of):
+        fields = [["q", "値"], ["token", "t0ken"], ["memo", ""], ["sel", "a"]]
+        return await pool.act(snap.session_id, snap.rev, await path_of("#f"), kind="submit", fields=fields)
+
+    result = run(site, scenario, page="/form.html")
+    assert result.status == "navigated"
+    # 送信ボタンを押していないため btn は含まれず、チェックしていない opt も送られない
+    assert echoed(result.snapshot.html) == "memo=;q=値;sel=a;token=t0ken"

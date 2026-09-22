@@ -565,9 +565,20 @@ class BrowserPool:
     # ------------------------------------------------------------ 操作の中継
 
     async def act(
-        self, session_id: str, rev: int, path: list[int], image_quality: str | None = None
+        self,
+        session_id: str,
+        rev: int,
+        path: list[int],
+        image_quality: str | None = None,
+        kind: str = "click",
+        fields: list[list[str]] | None = None,
+        submitter: list[int] | None = None,
     ) -> ActResult:
-        """スマホでタップされた要素（パスで指定）を PC 側でタップし、変化を差分として返す。"""
+        """スマホでの操作（パスで指定）を PC 側で再現し、変化を差分として返す。
+
+        kind="submit" では、スマホで入力された値（fields）を PC 側のフォームへ入れてから送信する。
+        PC 側のページが持つ Cookie や、フォームに埋め込まれたトークンをそのまま使える。
+        """
         s = self._sessions.get(session_id)
         if s is None or s.page is None or s.page.is_closed():
             return ActResult("expired")
@@ -582,26 +593,30 @@ class BrowserPool:
             s.popups.clear()
             ns = json.dumps(s.ns)
 
-            try:
-                handle = await page.evaluate_handle(f"(p) => window[{ns}] ? window[{ns}].resolve(p) : null", path)
-            except PlaywrightError:
-                return ActResult("reload")
-            element = handle.as_element()
-            if element is None:
-                await handle.dispose()
-                return ActResult("reload")
-            try:
+            if kind == "submit":
                 try:
-                    await element.tap(timeout=self._session_cfg.tap_timeout_ms)
+                    filled = await page.evaluate(
+                        f"(a) => window[{ns}] ? window[{ns}].fill(a) : false", {"path": path, "fields": fields or []}
+                    )
                 except PlaywrightError:
-                    # 他の要素に覆われている・見えていない場合でも、クリックのイベントだけは送る
-                    await element.dispatch_event("click")
-            except PlaywrightError as e:
-                log.info("タップを再現できません: %s", _first_line(e.message))
-                return ActResult("error", message="この要素はPC側で操作できませんでした。")
-            finally:
-                with contextlib.suppress(PlaywrightError):
-                    await handle.dispose()
+                    return ActResult("reload")
+                if not filled:
+                    return ActResult("reload")
+                # 送信ボタンが分かる場合はそれを押す（ボタンの名前と値、JS の処理も元のまま動く）
+                if submitter is not None:
+                    failed = await self._tap(page, s.ns, submitter)
+                    if failed is not None:
+                        return failed
+                else:
+                    try:
+                        await page.evaluate(f"(p) => window[{ns}].requestSubmit(p)", path)
+                    except PlaywrightError as e:
+                        log.info("フォームを送信できません: %s", _first_line(e.message))
+                        return ActResult("error", message="フォームを送信できませんでした。")
+            else:
+                failed = await self._tap(page, s.ns, path)
+                if failed is not None:
+                    return failed
 
             await self._settle_action(s, navigations_before)
 
@@ -640,6 +655,31 @@ class BrowserPool:
             s.css_sent.update(new_css)
             s.rev = int(data["rev"])
             return ActResult("ok", rev=s.rev, ops=data["ops"], css=data["css"])
+
+    async def _tap(self, page: Page, ns_name: str, path: list[int]) -> ActResult | None:
+        """パスが指す要素をタップする。問題があれば返す ActResult をそのまま応答に使う。"""
+        ns = json.dumps(ns_name)
+        try:
+            handle = await page.evaluate_handle(f"(p) => window[{ns}] ? window[{ns}].resolve(p) : null", path)
+        except PlaywrightError:
+            return ActResult("reload")
+        element = handle.as_element()
+        if element is None:
+            await handle.dispose()
+            return ActResult("reload")
+        try:
+            try:
+                await element.tap(timeout=self._session_cfg.tap_timeout_ms)
+            except PlaywrightError:
+                # 他の要素に覆われている・見えていない場合でも、クリックのイベントだけは送る
+                await element.dispatch_event("click")
+        except PlaywrightError as e:
+            log.info("タップを再現できません: %s", _first_line(e.message))
+            return ActResult("error", message="この要素はPC側で操作できませんでした。")
+        finally:
+            with contextlib.suppress(PlaywrightError):
+                await handle.dispose()
+        return None
 
     async def _settle_action(self, s: Session, navigations_before: int) -> None:
         """タップ後、DOM の変化と通信が落ち着くまで待つ。遷移が始まったら遷移の完了まで待つ。"""

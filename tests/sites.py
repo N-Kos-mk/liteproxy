@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import functools
+import html
 import http.server
 import threading
+import urllib.parse
 from pathlib import Path
 
 # JS で動く UI を並べたページ。PC 側での操作の再現（Phase 3）を確かめる
@@ -50,10 +52,40 @@ INTERACTIVE_PAGE = """<!doctype html>
 </body></html>
 """
 
+# POST 送信のページ。hidden の値はサイト側（PC 側のページ）が持つトークンに相当する
+FORM_PAGE = """<!doctype html>
+<html lang="ja"><head><meta charset="utf-8"><title>フォーム</title></head><body>
+<form id="f" method="post" action="/echo">
+  <input id="q" name="q" value="">
+  <input type="hidden" name="token" value="t0ken">
+  <textarea id="memo" name="memo"></textarea>
+  <label><input id="opt" type="checkbox" name="opt" value="1">選択</label>
+  <select id="sel" name="sel"><option value="a">A</option><option value="b">B</option></select>
+  <button id="send" name="btn" value="go">送信</button>
+</form>
+</body></html>
+"""
+
 NEXT_PAGE = '<!doctype html><html lang="ja"><head><meta charset="utf-8"><title>次</title></head><body><p id="next">次のページ</p></body></html>'
 
 
 class _Handler(http.server.SimpleHTTPRequestHandler):
+    def do_POST(self):  # noqa: N802
+        """受け取った内容をそのまま表示して返す。"""
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length).decode("utf-8")
+        pairs = sorted(urllib.parse.parse_qsl(body, keep_blank_values=True))
+        text = ";".join(f"{k}={v}" for k, v in pairs)
+        page = (
+            '<!doctype html><html lang="ja"><head><meta charset="utf-8"><title>受信</title></head>'
+            f'<body><p id="got">{html.escape(text)}</p></body></html>'
+        ).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(page)))
+        self.end_headers()
+        self.wfile.write(page)
+
     # Windows ではレジストリ次第で MIME タイプがずれるため明示する
     extensions_map = {
         **http.server.SimpleHTTPRequestHandler.extensions_map,
@@ -77,3 +109,4 @@ def serve(directory: Path) -> http.server.ThreadingHTTPServer:
 def write_interactive_site(root: Path) -> None:
     (root / "page.html").write_text(INTERACTIVE_PAGE, encoding="utf-8")
     (root / "next.html").write_text(NEXT_PAGE, encoding="utf-8")
+    (root / "form.html").write_text(FORM_PAGE, encoding="utf-8")

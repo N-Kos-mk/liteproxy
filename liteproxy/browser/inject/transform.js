@@ -448,6 +448,8 @@
     const action = abs(c.getAttribute('action') || pageURL) || pageURL;
     c.setAttribute('action', formPath);
     c.setAttribute('method', method === 'post' ? 'post' : 'get');
+    // POST は PC 側のページのフォームに値を入れて送信する（Cookie や埋め込みのトークンを使うため）
+    if (method === 'post') c.setAttribute('data-lp-post', '');
     // 子要素の走査位置がずれないよう、隠しフィールドは末尾に追加する
     for (const [name, value] of [[formActionField, action], [formCharsetField, document.characterSet]]) {
       const i = inert.createElement('input');
@@ -934,6 +936,56 @@
     return [...urls];
   }
 
+  // 値を入れない項目（ファイル選択と、送信・リセットなどのボタン）
+  const NO_VALUE = new Set(['file', 'submit', 'button', 'reset', 'image']);
+
+  // スマホで入力された値を、PC 側のフォームの同じ項目へ入れる
+  function fill({ path, fields }) {
+    const form = resolve(path);
+    if (!form || form.localName !== 'form') return false;
+    const controls = [...form.elements].filter((el) => el.name && !el.disabled);
+    for (const el of controls) {
+      if (el.type === 'checkbox' || el.type === 'radio') el.checked = false;
+    }
+    const seen = new Map();
+    for (const [name, value] of fields) {
+      const same = controls.filter((el) => el.name === name);
+      if (!same.length) continue;
+      const index = seen.get(name) || 0;
+      if (same[0].type === 'checkbox' || same[0].type === 'radio') {
+        const hit = same.find((el) => el.value === value) || same[index];
+        if (hit) hit.checked = true;
+        seen.set(name, index + 1);
+        continue;
+      }
+      const el = same[index] || same[0];
+      seen.set(name, index + 1);
+      const tag = el.localName;
+      if (tag === 'select') {
+        for (const o of el.options) if (o.value === value) o.selected = true;
+      } else if (tag === 'textarea' || (tag === 'input' && !NO_VALUE.has(el.type))) {
+        // React などが値の変化に気づけるよう、本来の setter を使ってから通知する
+        const proto = tag === 'textarea' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(proto, 'value');
+        if (setter && setter.set) setter.set.call(el, value);
+        else el.value = value;
+      } else {
+        continue; // 送信ボタンなど。名前と値はボタンを押したときにブラウザが付ける
+      }
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    return true;
+  }
+
+  // 送信ボタンが分からない場合の送信
+  function requestSubmit(path) {
+    const form = resolve(path);
+    if (!form || form.localName !== 'form') return false;
+    form.requestSubmit();
+    return true;
+  }
+
   // スマホから届いたパスが指す生きている要素。対応が取れない場合は最も近い祖先
   function resolve(path) {
     let m = mirror.documentElement;
@@ -983,6 +1035,8 @@
   const api = {
     sync,
     resolve,
+    fill,
+    requestSubmit,
     dirtyImages,
     quietMs: () => performance.now() - lastMutation,
     pathForSelector: (sel) => {

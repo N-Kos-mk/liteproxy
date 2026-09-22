@@ -6,6 +6,7 @@ import hashlib
 import logging
 import secrets
 from collections.abc import AsyncIterator
+import contextlib
 from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import quote, quote_plus
@@ -290,16 +291,30 @@ def create_app(
         # 独自ヘッダーを必須にし、他のサイトからのフォーム送信などで操作されないようにする
         if request.headers.get("x-lp") != "1":
             return PlainTextResponse("Forbidden", status_code=403)
+        def path_ok(value: object) -> bool:
+            return (
+                isinstance(value, list)
+                and len(value) <= 256
+                and all(isinstance(i, int) and 0 <= i < 100_000 for i in value)
+            )
+
         try:
             body = await request.json()
             session_id, rev, path = body["s"], body["r"], body["p"]
+            kind = body.get("k", "click")
+            fields = body.get("v") or []
+            submitter = body.get("b")
             valid = (
                 isinstance(session_id, str)
                 and len(session_id) <= 64
                 and isinstance(rev, int)
-                and isinstance(path, list)
-                and len(path) <= 256
-                and all(isinstance(i, int) and 0 <= i < 100_000 for i in path)
+                and path_ok(path)
+                and kind in ("click", "submit")
+                and isinstance(fields, list)
+                and len(fields) <= 500
+                and all(isinstance(f, list) and len(f) == 2 and all(isinstance(x, str) for x in f) for f in fields)
+                and sum(len(a) + len(b) for a, b in fields) <= 200_000
+                and (submitter is None or path_ok(submitter))
             )
         except (ValueError, KeyError, TypeError):
             valid = False
@@ -307,7 +322,9 @@ def create_app(
             return JSONResponse({"error": "要求の形式が不正です。"}, status_code=400)
 
         quality = image_quality(request) if config.image.precompute else None
-        result = await pool.act(session_id, rev, path, image_quality=quality)
+        result = await pool.act(
+            session_id, rev, path, image_quality=quality, kind=kind, fields=fields, submitter=submitter
+        )
         if result.status in ("expired", "reload"):
             return JSONResponse({result.status: True})
         if result.status == "error":
@@ -338,9 +355,15 @@ def create_app(
         return RedirectResponse(proxy_url(build_form_target(action, fields, charset)), status_code=303)
 
     @app.post("/f")
-    async def form_post() -> Response:
+    async def form_post(request: Request) -> Response:
+        """POST の送信は通常、スマホ側の JS が PC 側のページのフォームへ中継する。
+        ここへ届くのは、PC 側のページが保持されていない場合（JS が無効な場合を含む）。"""
         nonce = secrets.token_urlsafe(12)
-        message = "POST で送信するフォームにはまだ対応していません。"
-        return html_response(templates.error_page(message, nonce), nonce=nonce, status=501)
+        action = ""
+        with contextlib.suppress(Exception):
+            action = (await request.form()).get(FORM_ACTION_FIELD, "")
+        message = "PC側のページが保持されていないため、この送信はできません。ページを開き直してから送信してください。"
+        target = normalize_input(action) if isinstance(action, str) else None
+        return html_response(templates.error_page(message, nonce, target=target), nonce=nonce, status=409)
 
     return app

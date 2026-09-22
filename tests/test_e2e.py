@@ -129,3 +129,24 @@ def test_plain_text_tap_is_not_forwarded(phone):
     phone.click("#plain")
     phone.wait_for_timeout(300)
     assert not any(urlsplit(r).path == "/a" for r in requests)
+
+
+@pytest.fixture
+def phone_form(phone_browser, proxy, site):
+    context = phone_browser.new_context(viewport={"width": 390, "height": 844})
+    page = context.new_page()
+    page.goto(f"{proxy}/p?u={quote(site + '/form.html', safe='')}&f=1")
+    page.wait_for_selector("lp-bar[data-s]", timeout=60000)
+    yield page
+    context.close()
+
+
+def test_post_form_is_sent_from_phone(phone_form):
+    phone_form.fill("#q", "スマホ入力")
+    phone_form.fill("#memo", "メモ")
+    phone_form.check("#opt")
+    phone_form.select_option("#sel", "b")
+    phone_form.click("#send")
+    phone_form.wait_for_selector("#got", timeout=30000)
+    got = phone_form.text_content("#got")
+    assert got == "btn=go;memo=メモ;opt=1;q=スマホ入力;sel=b;token=t0ken"

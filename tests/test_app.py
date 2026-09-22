@@ -36,8 +36,8 @@ class FakeRenderer:
         self.act_result = act_result or ActResult("expired")
         self.act_calls = []
 
-    async def act(self, session_id, rev, path, image_quality=None):
-        self.act_calls.append((session_id, rev, path))
+    async def act(self, session_id, rev, path, image_quality=None, kind="click", fields=None, submitter=None):
+        self.act_calls.append((session_id, rev, path, kind, fields, submitter))
         return self.act_result
 
     async def start(self):
@@ -272,7 +272,7 @@ def test_act_returns_diff():
     with make_client(renderer) as client:
         res = client.post("/a", json=ACT, headers=LP)
     assert res.json() == {"r": 4, "ops": result.ops, "css": result.css}
-    assert renderer.act_calls == [("sess", 3, [1, 0, 2])]
+    assert renderer.act_calls == [("sess", 3, [1, 0, 2], "click", [], None)]
 
 
 @pytest.mark.parametrize("status", ["expired", "reload"])
@@ -319,10 +319,28 @@ def test_form_with_bad_action_is_rejected():
     assert res.status_code == 400
 
 
-def test_post_form_is_not_supported_yet():
+def test_post_form_without_a_pc_page_is_rejected():
+    """POST は通常スマホ側の JS が PC 側のページへ中継する。ここへ届くのは中継できないとき"""
     with make_client() as client:
-        res = client.post("/f")
-    assert res.status_code == 501
+        res = client.post("/f", data={"__lp_action": "https://e.com/post", "q": "x"})
+    assert res.status_code == 409 and "保持されていない" in res.text
+
+
+def test_act_submits_form_fields():
+    renderer = FakeRenderer(act_result=ActResult("ok", rev=9))
+    body = {**ACT, "k": "submit", "v": [["q", "値"], ["token", "t"]], "b": [1, 2]}
+    with make_client(renderer) as client:
+        res = client.post("/a", json=body, headers=LP)
+    assert res.json()["r"] == 9
+    assert renderer.act_calls == [("sess", 3, [1, 0, 2], "submit", [["q", "値"], ["token", "t"]], [1, 2])]
+
+
+@pytest.mark.parametrize("body", [{**ACT, "k": "other"}, {**ACT, "k": "submit", "v": [["a"]]},
+                                  {**ACT, "k": "submit", "v": [["a", 1]]}, {**ACT, "b": ["x"]},
+                                  {**ACT, "k": "submit", "v": [["a", "x" * 200_001]]}])
+def test_act_rejects_malformed_submit(body):
+    with make_client() as client:
+        assert client.post("/a", json=body, headers=LP).status_code == 400
 
 
 class _Verifier:
