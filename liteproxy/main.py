@@ -4,19 +4,20 @@ from __future__ import annotations
 
 import logging
 import secrets
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Protocol
-from urllib.parse import quote_plus
+from urllib.parse import quote, quote_plus
 
 import jwt
 from fastapi import FastAPI, Request
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 from . import templates
-from .browser import BrowserPool, NonHtml, RenderError, Snapshot, Viewport
+from .browser import BrowserPool, NonHtml, Snapshot, Viewport
 from .config import BrowserConfig, Config
+from .jobs import Job, Renderer, RenderJobs, RenderKey
 from .render import layout
 from .security import AccessVerifier, HostGuard
 from .stats import StatsLog, human
@@ -38,10 +39,8 @@ _CSP = (
 )
 
 
-class Renderer(Protocol):
-    async def start(self) -> None: ...
-    async def stop(self) -> None: ...
-    async def render(self, url: str, viewport: Viewport, user_agent: str | None) -> Snapshot | NonHtml: ...
+# 読み込み中画面へ、段階に変化がなくてもこの間隔で生存通知を送る
+LOADER_HEARTBEAT_SEC = 2.0
 
 
 def viewport_from_cookie(value: str | None, cfg: BrowserConfig) -> Viewport:
@@ -61,21 +60,47 @@ def viewport_from_cookie(value: str | None, cfg: BrowserConfig) -> Viewport:
         return default
 
 
-def html_response(
-    body: str, *, nonce: str, status: int = 200, max_age: int = 0, language: str | None = "ja"
-) -> HTMLResponse:
+def page_headers(*, nonce: str, cache_control: str = "no-store", language: str | None = "ja") -> dict[str, str]:
     """language は liteproxy 自身のページの言語。中継したページでは元の言語に任せるため None にする。"""
     headers = {
         "Content-Security-Policy": _CSP.format(nonce=nonce),
         "Referrer-Policy": "no-referrer",
         "X-Content-Type-Options": "nosniff",
         "X-Robots-Tag": "noindex, nofollow",
-        # 戻る操作で再取得しないよう、スマホのブラウザに短時間キャッシュさせる
-        "Cache-Control": f"private, max-age={max_age}" if max_age else "no-store",
+        "Cache-Control": cache_control,
     }
     if language:
         headers["Content-Language"] = language
+    return headers
+
+
+def html_response(
+    body: str, *, nonce: str, status: int = 200, max_age: int = 0, language: str | None = "ja"
+) -> HTMLResponse:
+    # 戻る操作で再取得しないよう、スマホのブラウザに短時間キャッシュさせる
+    cache_control = f"private, max-age={max_age}" if max_age else "no-store"
+    headers = page_headers(nonce=nonce, cache_control=cache_control, language=language)
     return HTMLResponse(body, status_code=status, headers=headers)
+
+
+def view_url(target: str, job_id: str) -> str:
+    return f"/v?u={quote(target, safe='')}&j={job_id}"
+
+
+async def loader_stream(job: Job, target: str, nonce: str) -> AsyncIterator[str]:
+    """読み込み中画面を送り、描画の段階が変わるたび（変化がなくても一定間隔で）進捗を追記する。"""
+    yield templates.loader_page(target, nonce)
+    seen = -1
+    while True:
+        seen = await job.wait_change(seen, LOADER_HEARTBEAT_SEC)
+        if job.error is not None:
+            yield templates.loader_update("error", job.elapsed_ms(), nonce, {"message": job.error})
+            return
+        if job.result is not None:
+            extra = {"next": view_url(target, job.id), "size": job.sent_bytes or 0}
+            yield templates.loader_update("done", job.elapsed_ms(), nonce, extra)
+            return
+        yield templates.loader_update(job.stage, job.elapsed_ms(), nonce)
 
 
 def create_app(
@@ -90,12 +115,35 @@ def create_app(
     if verifier is None and config.access.enabled:
         verifier = AccessVerifier(config.access.team_domain, config.access.aud, config.access.allowed_emails)
 
+    def on_complete(job: Job, result: Snapshot | NonHtml) -> int | None:
+        if isinstance(result, NonHtml):
+            return None
+        _, stats = layout.finalize(result, nonce="")
+        stats_log.write(stats)
+        return stats.gzip_bytes
+
+    jobs = RenderJobs(pool, on_complete=on_complete)
+
+    def render_key(request: Request, target: str) -> RenderKey:
+        viewport = viewport_from_cookie(request.cookies.get("lp_env"), config.browser)
+        return RenderKey(target, viewport, request.headers.get("user-agent", ""))
+
+    def result_response(result: Snapshot | NonHtml) -> Response:
+        nonce = secrets.token_urlsafe(12)
+        if isinstance(result, NonHtml):
+            size = human(result.size) if result.size is not None else "不明"
+            page = templates.non_html_page(result.url, result.content_type, size, nonce)
+            return html_response(page, nonce=nonce)
+        html, _ = layout.finalize(result, nonce)
+        return html_response(html, nonce=nonce, max_age=300, language=None)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         await pool.start()
         try:
             yield
         finally:
+            await jobs.aclose()
             await pool.stop()
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
@@ -146,20 +194,32 @@ def create_app(
             message = "このURLは開けません（内部ネットワーク宛て、またはブロック対象のドメインです）。"
             return html_response(templates.error_page(message, nonce), nonce=nonce, status=403)
 
-        viewport = viewport_from_cookie(request.cookies.get("lp_env"), config.browser)
-        try:
-            result = await pool.render(target, viewport, request.headers.get("user-agent"))
-        except RenderError as e:
-            return html_response(templates.error_page(str(e), nonce, target=target), nonce=nonce, status=502)
+        key = render_key(request, target)
+        cached = jobs.cached(key)
+        if cached is not None:
+            return result_response(cached)
+        # 描画を待たずに読み込み中画面を返し、進捗を流し続ける。完了したら /v へ移動させる。
+        # no-transform は Cloudflare に圧縮・加工させず、進捗をため込まずに届けるため
+        job = jobs.start(key)
+        return StreamingResponse(
+            loader_stream(job, target, nonce),
+            media_type="text/html",
+            headers=page_headers(nonce=nonce, cache_control="no-store, no-transform"),
+        )
 
-        if isinstance(result, NonHtml):
-            size = human(result.size) if result.size is not None else "不明"
-            page = templates.non_html_page(result.url, result.content_type, size, nonce)
-            return html_response(page, nonce=nonce)
-
-        html, stats = layout.finalize(result, nonce)
-        stats_log.write(stats)
-        return html_response(html, nonce=nonce, max_age=300, language=None)
+    @app.get("/v")
+    async def view(request: Request, u: str = "", j: str = "") -> Response:
+        """描画結果を表示する。結果が残っていなければ /p からやり直す。"""
+        target = normalize_input(u)
+        if target is None:
+            return RedirectResponse("/", status_code=303)
+        job = jobs.get(j)
+        result = job.result if job is not None and job.key.url == target else None
+        if result is None:
+            result = jobs.cached(render_key(request, target))
+        if result is None:
+            return RedirectResponse(proxy_url(target), status_code=303)
+        return result_response(result)
 
     @app.get("/f")
     async def form_get(request: Request) -> Response:

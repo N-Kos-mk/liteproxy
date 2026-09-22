@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -64,6 +65,14 @@ WAIT_IMAGES_JS = """async (timeout) => {
 # スマホへ送らず、描画結果の寸法にもほぼ影響しないため、PC 側でも取得しない
 BLOCKED_RESOURCE_TYPES = frozenset({"font", "media", "texttrack", "manifest"})
 HTML_TYPES = frozenset({"text/html", "application/xhtml+xml"})
+
+# 描画の段階。読み込み中画面（templates.loader_page）の表示と対応する
+STAGE_QUEUED = "queued"  # 同時描画数の上限に達していて順番待ち
+STAGE_FETCHING = "fetching"  # HTML を取得中
+STAGE_RUNNING = "running"  # ページの JS・CSS の読み込みが落ち着くのを待機中
+STAGE_SCROLLING = "scrolling"  # 遅延読み込みの画像などを読み込ませるためにスクロール中
+STAGE_TRANSFORMING = "transforming"  # 軽量 HTML へ変換中
+StageCallback = Callable[[str], None]
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36"
@@ -211,8 +220,18 @@ class BrowserPool:
         assert self._browser is not None
         return self._browser
 
-    async def render(self, url: str, viewport: Viewport, user_agent: str | None) -> Snapshot | NonHtml:
+    async def render(
+        self,
+        url: str,
+        viewport: Viewport,
+        user_agent: str | None,
+        on_stage: StageCallback | None = None,
+    ) -> Snapshot | NonHtml:
+        """on_stage には処理の段階（STAGE_*）が順に渡される。読み込み中画面の表示に使う。"""
+        stage = on_stage or (lambda _: None)
+        stage(STAGE_QUEUED)
         async with self._sem:
+            stage(STAGE_FETCHING)
             started = time.perf_counter()
             browser = await self._ensure_browser()
             # スマホと同じ画面条件で描画し、レイアウト（寸法・メディアクエリ）を一致させる
@@ -228,12 +247,14 @@ class BrowserPool:
                 service_workers="block",
             )
             try:
-                return await self._render(context, url, started)
+                return await self._render(context, url, started, stage)
             finally:
                 with contextlib.suppress(PlaywrightError):
                     await context.close()
 
-    async def _render(self, context: BrowserContext, url: str, started: float) -> Snapshot | NonHtml:
+    async def _render(
+        self, context: BrowserContext, url: str, started: float, stage: StageCallback
+    ) -> Snapshot | NonHtml:
         net = _NetStats()
         css_texts: dict[str, str] = {}
         css_tasks: list[asyncio.Future] = []
@@ -283,7 +304,9 @@ class BrowserPool:
             raise RenderError("転送先の URL は開けません。")
 
         cfg = self._cfg
+        stage(STAGE_RUNNING)
         await inflight.wait(cfg.quiet_ms, cfg.settle_timeout_ms)
+        stage(STAGE_SCROLLING)
         try:
             await page.evaluate(SCROLL_JS, {"maxSteps": cfg.scroll_max_steps, "delay": cfg.scroll_delay_ms})
             # スクロールで始まった追加読み込みと、寸法の分からない画像を同時に待つ
@@ -309,6 +332,7 @@ class BrowserPool:
             "maxDataUri": rc.max_data_uri,
             "pruneClasses": rc.prune_classes,
         }
+        stage(STAGE_TRANSFORMING)
         transform_started = time.perf_counter()
         try:
             result = await page.evaluate(TRANSFORM_JS, args)

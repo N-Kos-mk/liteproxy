@@ -1,3 +1,6 @@
+import asyncio
+import json
+import re
 from urllib.parse import quote
 
 import jwt
@@ -22,8 +25,9 @@ SNAPSHOT = Snapshot(
 
 
 class FakeRenderer:
-    def __init__(self, result=SNAPSHOT):
+    def __init__(self, result=SNAPSHOT, *, delay=0.0):
         self.result = result
+        self.delay = delay
         self.calls = []
 
     async def start(self):
@@ -32,8 +36,12 @@ class FakeRenderer:
     async def stop(self):
         pass
 
-    async def render(self, url, viewport, user_agent):
+    async def render(self, url, viewport, user_agent, on_stage=None):
         self.calls.append((url, viewport, user_agent))
+        for stage in ("fetching", "running", "transforming"):
+            if on_stage:
+                on_stage(stage)
+            await asyncio.sleep(self.delay)
         if isinstance(self.result, Exception):
             raise self.result
         return self.result
@@ -44,6 +52,14 @@ def make_client(renderer=None, **kwargs):
     config.log.stats_file = ""
     app = create_app(config, renderer=renderer or FakeRenderer(), **kwargs)
     return TestClient(app, follow_redirects=False)
+
+
+def open_page(client, url, **kwargs):
+    """/p の読み込み中画面を最後まで受け取り、移動先の /v を開く。"""
+    loader = client.get("/p", params={"u": url}, **kwargs)
+    m = re.search(r'lp\("done", \d+, (\{.*?\})\)</script>', loader.text)
+    assert m, "読み込み中画面が完了を通知していない"
+    return loader, client.get(json.loads(m.group(1))["next"], **kwargs)
 
 
 def test_home_has_address_form_and_csp():
@@ -77,39 +93,67 @@ def test_private_url_is_rejected():
     assert renderer.calls == []
 
 
-def test_proxy_renders_with_phone_viewport():
+def test_loader_then_result_with_phone_viewport():
     renderer = FakeRenderer()
     with make_client(renderer) as client:
         client.cookies.set("lp_env", "412_915_2.625_1")
-        res = client.get("/p", params={"u": "https://8.8.8.8/"}, headers={"User-Agent": "PhoneUA"})
-    assert res.status_code == 200
+        loader, res = open_page(client, "https://8.8.8.8/", headers={"User-Agent": "PhoneUA"})
+    # 読み込み中画面は加工・キャッシュさせない
+    assert loader.status_code == 200
+    assert loader.headers["cache-control"] == "no-store, no-transform"
+    assert "PCで処理しています" in loader.text
     assert renderer.calls == [("https://8.8.8.8/", Viewport(412, 915, 2.625, True), "PhoneUA")]
+    # 移動先の /v に描画結果が出る
+    assert res.status_code == 200
     assert "<lp-bar>" in res.text and "<!--lp-bar-->" not in res.text
     assert "タイトル" in res.text
     assert "1.9MB" in res.text  # PC 側の取得量
-    assert "private, max-age=300" == res.headers["cache-control"]
+    assert res.headers["cache-control"] == "private, max-age=300"
     assert "content-language" not in res.headers  # 中継したページは元の言語に任せる
     nonce = res.headers["content-security-policy"].split("'nonce-")[1].split("'")[0]
     assert f'<script nonce="{nonce}">' in res.text
 
 
+def test_loader_reports_each_stage():
+    with make_client(FakeRenderer(delay=0.05)) as client:
+        loader, _ = open_page(client, "https://8.8.8.8/")
+    for stage in ("fetching", "running", "transforming", "done"):
+        assert f'lp("{stage}"' in loader.text
+
+
+def test_recent_result_is_served_without_loader():
+    renderer = FakeRenderer()
+    with make_client(renderer) as client:
+        open_page(client, "https://8.8.8.8/")
+        res = client.get("/p", params={"u": "https://8.8.8.8/"})
+    assert "<lp-bar>" in res.text and "PCで処理しています" not in res.text
+    assert len(renderer.calls) == 1
+
+
+def test_view_without_result_starts_over():
+    with make_client() as client:
+        res = client.get("/v", params={"u": "https://8.8.8.8/", "j": "unknown"})
+    assert res.status_code == 303
+    assert res.headers["location"] == "/p?u=" + quote("https://8.8.8.8/", safe="")
+
+
 def test_large_page_is_gzipped():
     snap = Snapshot(**{**SNAPSHOT.__dict__, "html": SNAPSHOT.html.replace("本文", "本文" * 2000)})
     with make_client(FakeRenderer(snap)) as client:
-        res = client.get("/p", params={"u": "https://8.8.8.8/"}, headers={"Accept-Encoding": "gzip"})
+        _, res = open_page(client, "https://8.8.8.8/", headers={"Accept-Encoding": "gzip"})
     assert res.headers["content-encoding"] == "gzip"
 
 
-def test_render_error_page():
+def test_render_error_is_shown_on_loader():
     with make_client(FakeRenderer(RenderError("タイムアウト"))) as client:
         res = client.get("/p", params={"u": "https://8.8.8.8/"})
-    assert res.status_code == 502
-    assert "タイムアウト" in res.text and "再試行" in res.text
+    assert res.status_code == 200
+    assert 'lp("error"' in res.text and "タイムアウト" in res.text and "再試行" in res.text
 
 
 def test_non_html_page():
     with make_client(FakeRenderer(NonHtml("https://8.8.8.8/a.pdf", "application/pdf", 2048))) as client:
-        res = client.get("/p", params={"u": "https://8.8.8.8/a.pdf"})
+        _, res = open_page(client, "https://8.8.8.8/a.pdf")
     assert res.status_code == 200
     assert "application/pdf" in res.text and "2.0KB" in res.text
 
