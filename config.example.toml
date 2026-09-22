@@ -31,6 +31,8 @@ default_dpr = 3.0
 max_inline_svg = 3000  # これより大きいインライン SVG は中身を捨てて枠だけ残す
 max_data_uri = 2048    # これ以下の data: URI（小さなアイコン等）はそのまま残す
 prune_classes = true   # CSS から参照されない class 名を削る
+default_mode = "layout"  # 既定の表示モード（layout: レイアウトを保つ / reader: 本文だけ）
+reader_min_chars = 300   # reader モードで本文とみなす最小の文字数。下回ると layout に切り替える
 # 描画結果から取り除く要素（JS なしでは閉じられない Cookie 同意バナーなど）
 remove_selectors = [
   "#onetrust-consent-sdk",

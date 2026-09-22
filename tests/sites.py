@@ -9,6 +9,8 @@ import threading
 import urllib.parse
 from pathlib import Path
 
+from PIL import Image
+
 # JS で動く UI を並べたページ。PC 側での操作の再現（Phase 3）を確かめる
 INTERACTIVE_PAGE = """<!doctype html>
 <html lang="ja"><head><meta charset="utf-8">
@@ -66,6 +68,33 @@ FORM_PAGE = """<!doctype html>
 </body></html>
 """
 
+# 記事のページ。reader モード（本文の抽出）を確かめる
+ARTICLE_PAGE = """<!doctype html>
+<html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>本文抽出のテスト記事 | テストサイト</title>
+<style>body{font-family:sans-serif}.ad{background:#eee}</style>
+</head><body>
+<header id="site-header"><nav><a href="/">ホーム</a> <a href="/list.html">記事一覧</a> <a href="/about.html">運営情報</a></nav></header>
+<div class="ad" id="ad-top">広告枠です。ここは本文ではありません。クリックで別サイトへ移動します。</div>
+<main>
+<article>
+<h1>本文抽出のテスト記事</h1>
+<p class="lead">この記事は、本文だけを抽出する機能を確かめるために用意したものです。導入の段落として、十分な長さの日本語の文章を書いておきます。通信量を抑えるために、本文以外の部分は取り除かれます。</p>
+<h2>最初の見出し</h2>
+<p>最初の節の本文です。ここでは、抽出した結果に見出しと段落が残ることを確かめます。日本語の文章として自然な長さになるよう、もう少し文章を続けて書いておきます。記事らしい体裁を保つことが目的です。</p>
+<p>二つ目の段落では、<a href="/next.html">別のページへのリンク</a>と、<strong>強調した語</strong>を含めます。リンクは中継経由に書き換えられ、強調は残ります。この段落も十分な長さにしておきます。</p>
+<figure><img src="/photo.png" alt="写真の説明文" width="400" height="200"><figcaption>図の説明です</figcaption></figure>
+<h2>二つ目の見出し</h2>
+<ul><li>箇条書きの一つ目です。</li><li>箇条書きの二つ目です。</li><li>箇条書きの三つ目です。</li></ul>
+<p>最後の段落です。抽出の対象として十分な文字数になるよう、本文の分量を確保しています。日本語の記事として読める内容になっていれば、判定の条件を満たします。もう少し文章を足しておきます。</p>
+</article>
+</main>
+<aside id="related"><h2>関連記事</h2><ul><li><a href="/other1.html">関連記事その一</a></li><li><a href="/other2.html">関連記事その二</a></li></ul></aside>
+<footer id="site-footer"><p>フッターの表記です。著作権表示など。</p></footer>
+</body></html>
+"""
+
 NEXT_PAGE = '<!doctype html><html lang="ja"><head><meta charset="utf-8"><title>次</title></head><body><p id="next">次のページ</p></body></html>'
 
 
@@ -110,3 +139,5 @@ def write_interactive_site(root: Path) -> None:
     (root / "page.html").write_text(INTERACTIVE_PAGE, encoding="utf-8")
     (root / "next.html").write_text(NEXT_PAGE, encoding="utf-8")
     (root / "form.html").write_text(FORM_PAGE, encoding="utf-8")
+    (root / "article.html").write_text(ARTICLE_PAGE, encoding="utf-8")
+    Image.new("RGB", (400, 200), (40, 90, 160)).save(root / "photo.png", "PNG")

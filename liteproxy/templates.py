@@ -166,6 +166,7 @@ def toolbar(
     client_src: str,
     session_id: str | None = None,
     rev: int = 0,
+    mode: str = "layout",
 ) -> str:
     """client.js へ渡す情報を属性に持たせる。
 
@@ -178,6 +179,9 @@ def toolbar(
         f'<a href="/"><b>LP</b></a><span class="t">{escape(title)}</span>'
         f'<span title="送信量（圧縮後の目安） / PC 側の取得量">{escape(sent)} / {escape(fetched)}</span>'
         '<button type="button" id="lp-img" title="画像の読み込みと画質の設定">画像</button>'
+        f'<a href="/p?u={quote(url, safe="")}&m={"layout" if mode == "reader" else "reader"}" '
+        f'title="{"レイアウトを保った表示に切り替える" if mode == "reader" else "本文だけの表示に切り替える"}">'
+        f'{"全体" if mode == "reader" else "本文"}</a>'
         f'<a href="{escape(url)}" rel="noreferrer" title="元のページを直接開く（通信量に注意）">元</a>'
         f'</lp-bar>{env_script(nonce, own=True)}<script src="{escape(client_src)}" defer data-lp-x></script>'
     )

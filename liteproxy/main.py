@@ -57,6 +57,9 @@ _CLIENT_JS = (Path(__file__).parent / "static" / "client.js").read_bytes()
 CLIENT_SRC = f"/static/client.js?v={hashlib.sha256(_CLIENT_JS).hexdigest()[:10]}"
 
 
+# 表示モード（layout: レイアウトを保つ / reader: 本文だけ）
+MODES = ("layout", "reader")
+
 # 読み込み中画面へ、段階に変化がなくてもこの間隔で生存通知を送る
 LOADER_HEARTBEAT_SEC = 2.0
 
@@ -145,15 +148,24 @@ def create_app(
 
     jobs = RenderJobs(pool, on_complete=on_complete)
 
+    def page_mode(request: Request, requested: str = "") -> str:
+        """表示モードは、URL の m、Cookie（lp_m）、設定の既定値の順に決める。"""
+        if requested in MODES:
+            return requested
+        cookie = request.cookies.get("lp_m", "")
+        return cookie if cookie in MODES else config.render.default_mode
+
     def image_quality(request: Request) -> str:
         q = request.cookies.get("lp_q", "")
         return q if q in QUALITY_LABELS else default_quality
 
-    def render_key(request: Request, target: str) -> RenderKey:
+    def render_key(request: Request, target: str, mode: str | None = None) -> RenderKey:
         viewport = viewport_from_cookie(request.cookies.get("lp_env"), config.browser)
         # 画像の枠に表示するサイズは画質ごとに異なるため、画質も描画条件に含める
         quality = image_quality(request) if config.image.precompute else None
-        return RenderKey(target, viewport, request.headers.get("user-agent", ""), quality)
+        return RenderKey(
+            target, viewport, request.headers.get("user-agent", ""), quality, mode or page_mode(request)
+        )
 
     def result_response(result: Snapshot | NonHtml) -> Response:
         nonce = secrets.token_urlsafe(12)
@@ -244,9 +256,17 @@ def create_app(
         return RedirectResponse(proxy_url(target), status_code=303)
 
     @app.get("/p")
-    async def proxy(request: Request, u: str = "", f: str = "") -> Response:
-        """f=1 なら保持している結果を使わずに描画し直す（PC 側のページが失われた場合など）。"""
+    async def proxy(request: Request, u: str = "", f: str = "", m: str = "") -> Response:
+        """m で表示モードを指定できる（layout / reader）。指定すると次のページからも同じモードになる。
+
+        f=1 なら保持している結果を使わずに描画し直す（PC 側のページが失われた場合など）。
+        """
         nonce = secrets.token_urlsafe(12)
+
+        def keep_mode(response: Response) -> Response:
+            if m in MODES:
+                response.set_cookie("lp_m", m, max_age=31536000, path="/", samesite="lax")
+            return response
         target = normalize_input(u)
         if target is None:
             if u.strip():
@@ -257,18 +277,20 @@ def create_app(
             message = "このURLは開けません（内部ネットワーク宛て、またはブロック対象のドメインです）。"
             return html_response(templates.error_page(message, nonce), nonce=nonce, status=403)
 
-        key = render_key(request, target)
+        key = render_key(request, target, page_mode(request, m))
         force = f == "1"
         cached = None if force else jobs.cached(key)
         if cached is not None:
-            return result_response(cached)
+            return keep_mode(result_response(cached))
         # 描画を待たずに読み込み中画面を返し、進捗を流し続ける。完了したら /v へ移動させる。
         # no-transform は Cloudflare に圧縮・加工させず、進捗をため込まずに届けるため
         job = jobs.start(key, force=force)
-        return StreamingResponse(
-            loader_stream(job, target, nonce),
-            media_type="text/html",
-            headers=page_headers(nonce=nonce, cache_control="no-store, no-transform"),
+        return keep_mode(
+            StreamingResponse(
+                loader_stream(job, target, nonce),
+                media_type="text/html",
+                headers=page_headers(nonce=nonce, cache_control="no-store, no-transform"),
+            )
         )
 
     @app.get("/v")

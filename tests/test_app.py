@@ -46,9 +46,10 @@ class FakeRenderer:
     async def stop(self):
         pass
 
-    async def render(self, url, viewport, user_agent, on_stage=None, image_quality=None):
+    async def render(self, url, viewport, user_agent, on_stage=None, image_quality=None, mode="layout"):
         self.calls.append((url, viewport, user_agent))
         self.image_quality = image_quality
+        self.mode = mode
         for stage in ("fetching", "running", "transforming"):
             if on_stage:
                 on_stage(stage)
@@ -301,6 +302,28 @@ def test_csp_allows_only_same_origin_requests():
     with make_client() as client:
         csp = client.get("/").headers["content-security-policy"]
     assert "connect-src 'self'" in csp
+
+
+def test_reader_mode_is_requested_and_remembered():
+    renderer = FakeRenderer()
+    with make_client(renderer) as client:
+        res = client.get("/p", params={"u": "https://8.8.8.8/", "m": "reader"})
+        assert renderer.mode == "reader"
+        assert res.cookies.get("lp_m") == "reader"
+        # 次のページは Cookie でモードが決まる
+        client.get("/p", params={"u": "https://8.8.8.8/next"})
+        assert renderer.mode == "reader"
+        # 不正な値は無視して Cookie の値を使う
+        client.get("/p", params={"u": "https://8.8.8.8/other", "m": "bogus"})
+        assert renderer.mode == "reader"
+
+
+@pytest.mark.parametrize(("mode", "label", "switch"), [("layout", "本文", "reader"), ("reader", "全体", "layout")])
+def test_toolbar_switches_modes(mode, label, switch):
+    snap = Snapshot(**{**SNAPSHOT.__dict__, "mode": mode})
+    with make_client(FakeRenderer(snap)) as client:
+        _, res = open_page(client, "https://8.8.8.8/")
+    assert f'&m={switch}" title=' in res.text and f">{label}</a>" in res.text
 
 
 def test_get_form_is_forwarded():

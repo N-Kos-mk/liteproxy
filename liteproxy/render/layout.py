@@ -10,7 +10,7 @@ from ..templates import BAR_CSS, toolbar
 
 
 def finalize(snap: Snapshot, nonce: str, *, default_quality: str, client_src: str) -> tuple[str, PageStats]:
-    """変換済みスナップショットにツールバーを差し込み、送信する HTML と統計を返す。"""
+    """変換済みスナップショット（layout / reader）にツールバーを差し込み、送信する HTML と統計を返す。"""
     gzip_bytes = compressed_size(snap.html)
     bar = toolbar(
         title=snap.title or urlsplit(snap.url).hostname or snap.url,
@@ -23,6 +23,7 @@ def finalize(snap: Snapshot, nonce: str, *, default_quality: str, client_src: st
         client_src=client_src,
         session_id=snap.session_id,
         rev=snap.rev,
+        mode=snap.mode,
     )
     # liteproxy が足す要素には data-lp-x を付け、操作の差分で要素の位置を数えるときに除く
     html = snap.html.replace("<!--lp-bar-->", bar, 1).replace(

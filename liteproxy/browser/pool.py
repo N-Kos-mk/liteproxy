@@ -33,6 +33,7 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from ..config import BrowserConfig, RenderConfig, SessionConfig
 from ..media.image import ImageData, ImageStore
+from ..render import reader
 from ..security import HostGuard
 from ..urls import FORM_ACTION_FIELD, FORM_CHARSET_FIELD, FORM_PATH, PROXY_PATH
 
@@ -94,6 +95,17 @@ WAIT_IMAGES_JS = """async (timeout) => {
   return pending.length;
 }"""
 
+# reader モード用。描画後の HTML と、画像の元の寸法
+RENDERED_JS = """() => {
+  const images = {};
+  for (const i of document.images) {
+    const u = i.currentSrc || i.src;
+    if (u && /^https?:/.test(u) && i.naturalWidth) images[u] = [i.naturalWidth, i.naturalHeight];
+  }
+  return { html: document.documentElement.outerHTML, images, title: document.title,
+           lang: document.documentElement.lang || 'ja' };
+}"""
+
 # 置き換え対象になる <img> の URL（描画時に既定の画質へ変換する対象）
 IMAGE_URLS_JS = """() => [...new Set([...document.images]
   .map((i) => i.currentSrc || i.src)
@@ -138,6 +150,7 @@ class Snapshot:
     image_ms: int = 0  # elapsed_ms のうち画像を既定の画質へ変換した時間
     image_count: int = 0  # サイズを表示した画像の数
     image_quality: str | None = None  # 表示したサイズの画質
+    mode: str = "layout"  # 実際に使った表示モード（reader で本文が取れない場合は layout になる）
     session_id: str | None = None  # PC 側で保持しているページ（操作の中継に使う）
     rev: int = 0  # この HTML の版。操作の差分はこの版からの変化として返す
 
@@ -376,6 +389,7 @@ class BrowserPool:
         user_agent: str | None,
         on_stage: StageCallback | None = None,
         image_quality: str | None = None,
+        mode: str = "layout",
     ) -> Snapshot | NonHtml:
         """on_stage には処理の段階（STAGE_*）が順に渡される。読み込み中画面の表示に使う。
 
@@ -393,8 +407,9 @@ class BrowserPool:
                 non_html = await self._open(session, url)
                 if non_html is not None:
                     return non_html
-                snap = await self._capture(session, stage, image_quality, started, (0, 0, 0))
-                if self._session_cfg.enabled:
+                snap = await self._capture(session, stage, image_quality, started, (0, 0, 0), mode)
+                # reader モードは本文だけを返し、操作の中継を使わないためページを保持しない
+                if self._session_cfg.enabled and snap.mode == "layout":
                     keep = True
                     snap.session_id = session.id
                     self._register(session)
@@ -484,6 +499,7 @@ class BrowserPool:
         image_quality: str | None,
         started: float,
         base: tuple[int, int, int],
+        mode: str = "layout",
     ) -> Snapshot:
         """読み込まれたページの状態を落ち着かせてから、軽量 HTML に変換する。"""
         page = s.page
@@ -514,6 +530,12 @@ class BrowserPool:
                 urls = []
             image_sizes = await self._images.prepare(urls, image_quality, self._screen_px(s))
         image_ms = round((time.perf_counter() - image_started) * 1000)
+
+        if mode == "reader":
+            snap = await self._capture_reader(s, image_sizes, image_ms, started, base)
+            if snap is not None:
+                return snap
+            log.info("本文を抽出できないため layout モードで返します: %s", page.url)
 
         origin = _origin(page.url)
         cross = {u: t for u, t in s.css_texts.items() if _origin(u) != origin}
@@ -556,6 +578,47 @@ class BrowserPool:
             image_count=len(image_sizes),
             image_quality=image_quality if image_sizes else None,
             rev=s.rev,
+        )
+
+    async def _capture_reader(
+        self, s: Session, image_sizes: dict[str, int], image_ms: int, started: float, base: tuple[int, int, int]
+    ) -> Snapshot | None:
+        """本文だけを抽出して返す。抽出できない場合は None（呼び出し側が layout モードへ切り替える）。"""
+        page = s.page
+        assert page is not None
+        transform_started = time.perf_counter()
+        try:
+            data = await page.evaluate(RENDERED_JS)
+        except PlaywrightError as e:
+            raise RenderError(f"ページを取り出せませんでした: {_first_line(e.message)}") from e
+        document = await asyncio.to_thread(reader.extract, data["html"], page.url)
+        if document is None:
+            return None
+        dims = {u: (int(v[0]), int(v[1])) for u, v in data["images"].items()}
+        article = await asyncio.to_thread(
+            reader.build,
+            document,
+            placeholder=reader.placeholders(dims, image_sizes, s.viewport.width - 32),
+            fallback_title=data["title"],
+        )
+        if article.chars < self._render_cfg.reader_min_chars:
+            return None
+        html = reader.page(article, lang=data["lang"] or "ja")
+        bytes0, requests0, blocked0 = base
+        return Snapshot(
+            url=page.url,
+            title=article.title or data["title"],
+            html=html,
+            pc_bytes=s.net.bytes - bytes0,
+            requests=s.net.requests - requests0,
+            blocked=s.net.blocked - blocked0,
+            css_bytes=len(reader.READER_CSS),
+            elapsed_ms=round((time.perf_counter() - started) * 1000),
+            transform_ms=round((time.perf_counter() - transform_started) * 1000),
+            image_ms=image_ms,
+            image_count=len(image_sizes),
+            image_quality=None,
+            mode="reader",
         )
 
     @staticmethod
