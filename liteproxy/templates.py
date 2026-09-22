@@ -29,7 +29,7 @@ BAR_CSS = (
     "lp-bar{all:initial;display:flex;gap:10px;align-items:center;padding:3px 8px;"
     "background:#1f2328;color:#d0d7de;font:12px/1.7 system-ui,sans-serif;white-space:nowrap;overflow:hidden}"
     "lp-bar *{all:unset}"
-    "lp-bar a{color:#79c0ff;cursor:pointer}"
+    "lp-bar a,lp-bar button{color:#79c0ff;cursor:pointer}"
     "lp-bar b{font-weight:700;color:#fff}"
     "lp-bar .t{flex:1;overflow:hidden;text-overflow:ellipsis}"
 )
@@ -152,10 +152,23 @@ def loader_update(stage: str, elapsed_ms: int, nonce: str, extra: dict | None = 
     return f'<script nonce="{nonce}">lp({payload})</script>'
 
 
-def toolbar(*, title: str, url: str, sent: str, fetched: str, nonce: str) -> str:
+def toolbar(
+    *,
+    title: str,
+    url: str,
+    sent: str,
+    fetched: str,
+    nonce: str,
+    sized_quality: str | None,
+    default_quality: str,
+    client_src: str,
+) -> str:
+    """sized_quality は画像の枠に表示したサイズの画質。client.js が読み込み時の画質の判断に使う。"""
     return (
-        f'<lp-bar><a href="/"><b>LP</b></a><span class="t">{escape(title)}</span>'
+        f'<lp-bar data-page="{escape(url)}" data-q="{escape(sized_quality or "")}" '
+        f'data-dq="{escape(default_quality)}"><a href="/"><b>LP</b></a><span class="t">{escape(title)}</span>'
         f'<span title="送信量（圧縮後の目安） / PC 側の取得量">{escape(sent)} / {escape(fetched)}</span>'
+        '<button type="button" id="lp-img" title="画像の読み込みと画質の設定">画像</button>'
         f'<a href="{escape(url)}" rel="noreferrer" title="元のページを直接開く（通信量に注意）">元</a>'
-        f"</lp-bar>{env_script(nonce)}"
+        f'</lp-bar>{env_script(nonce)}<script src="{escape(client_src)}" defer></script>'
     )

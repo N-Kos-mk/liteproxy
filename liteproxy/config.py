@@ -65,6 +65,14 @@ class RenderConfig:
 
 
 @dataclass
+class ImageConfig:
+    default_quality: str = "mid"  # 画質を選んでいないときの既定（low / mid / high / orig）
+    precompute: bool = True  # 描画時に既定の画質へ変換し、画像の枠にサイズを表示する
+    cache_mb: int = 256  # 元画像と変換結果を保持するメモリの上限
+    max_image_mb: int = 20  # 1 枚あたりの取得上限
+
+
+@dataclass
 class NetworkConfig:
     # true にすると LAN・ループバック宛ての取得を許可する（テスト用。通常は false）
     allow_private: bool = False
@@ -111,6 +119,7 @@ class Config:
     access: AccessConfig = field(default_factory=AccessConfig)
     browser: BrowserConfig = field(default_factory=BrowserConfig)
     render: RenderConfig = field(default_factory=RenderConfig)
+    image: ImageConfig = field(default_factory=ImageConfig)
     network: NetworkConfig = field(default_factory=NetworkConfig)
     search: SearchConfig = field(default_factory=SearchConfig)
     log: LogConfig = field(default_factory=LogConfig)
@@ -121,6 +130,7 @@ _SECTIONS = {
     "access": AccessConfig,
     "browser": BrowserConfig,
     "render": RenderConfig,
+    "image": ImageConfig,
     "network": NetworkConfig,
     "search": SearchConfig,
     "log": LogConfig,
@@ -153,4 +163,6 @@ def load_config(path: Path | None) -> Config:
         raise ConfigError("[access] enabled = true の場合は team_domain と aud が必要です")
     if "{q}" not in config.search.url:
         raise ConfigError("[search] url には {q} を含めてください")
+    if config.image.default_quality not in ("low", "mid", "high", "orig"):
+        raise ConfigError("[image] default_quality は low / mid / high / orig のいずれかにしてください")
     return config

@@ -9,11 +9,12 @@ dependencies = [
     "uvicorn>=0.30",
     "playwright>=1.48",
     "pyjwt[crypto]>=2.9",
+    "pillow>=12.3.0",
+    "httpx2>=2.13.0",
 ]
 
 [dependency-groups]
 dev = [
-    "httpx2>=2.13.0",
     "pytest>=8",
 ]
 

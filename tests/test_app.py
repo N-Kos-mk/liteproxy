@@ -1,15 +1,19 @@
 import asyncio
+import http.server
+import io
 import json
 import re
+import threading
 from urllib.parse import quote
 
 import jwt
 import pytest
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from liteproxy.browser import NonHtml, RenderError, Snapshot, Viewport
 from liteproxy.config import Config
-from liteproxy.main import create_app, viewport_from_cookie
+from liteproxy.main import CLIENT_SRC, create_app, viewport_from_cookie
 
 SNAPSHOT = Snapshot(
     url="https://8.8.8.8/final",
@@ -36,8 +40,9 @@ class FakeRenderer:
     async def stop(self):
         pass
 
-    async def render(self, url, viewport, user_agent, on_stage=None):
+    async def render(self, url, viewport, user_agent, on_stage=None, image_quality=None):
         self.calls.append((url, viewport, user_agent))
+        self.image_quality = image_quality
         for stage in ("fetching", "running", "transforming"):
             if on_stage:
                 on_stage(stage)
@@ -47,8 +52,8 @@ class FakeRenderer:
         return self.result
 
 
-def make_client(renderer=None, **kwargs):
-    config = Config()
+def make_client(renderer=None, config=None, **kwargs):
+    config = config or Config()
     config.log.stats_file = ""
     app = create_app(config, renderer=renderer or FakeRenderer(), **kwargs)
     return TestClient(app, follow_redirects=False)
@@ -105,7 +110,7 @@ def test_loader_then_result_with_phone_viewport():
     assert renderer.calls == [("https://8.8.8.8/", Viewport(412, 915, 2.625, True), "PhoneUA")]
     # 移動先の /v に描画結果が出る
     assert res.status_code == 200
-    assert "<lp-bar>" in res.text and "<!--lp-bar-->" not in res.text
+    assert "<lp-bar " in res.text and "<!--lp-bar-->" not in res.text
     assert "タイトル" in res.text
     assert "1.9MB" in res.text  # PC 側の取得量
     assert res.headers["cache-control"] == "private, max-age=300"
@@ -126,7 +131,7 @@ def test_recent_result_is_served_without_loader():
     with make_client(renderer) as client:
         open_page(client, "https://8.8.8.8/")
         res = client.get("/p", params={"u": "https://8.8.8.8/"})
-    assert "<lp-bar>" in res.text and "PCで処理しています" not in res.text
+    assert "<lp-bar " in res.text and "PCで処理しています" not in res.text
     assert len(renderer.calls) == 1
 
 
@@ -156,6 +161,76 @@ def test_non_html_page():
         _, res = open_page(client, "https://8.8.8.8/a.pdf")
     assert res.status_code == 200
     assert "application/pdf" in res.text and "2.0KB" in res.text
+
+
+def test_toolbar_passes_image_settings_to_client():
+    with make_client() as client:
+        client.cookies.set("lp_q", "low")
+        _, res = open_page(client, "https://8.8.8.8/")
+        js = client.get(CLIENT_SRC)
+    assert 'data-page="https://8.8.8.8/final"' in res.text
+    assert 'data-dq="mid"' in res.text and 'id="lp-img"' in res.text
+    assert f'<script src="{CLIENT_SRC}" defer></script>' in res.text
+    assert "img-src 'self' data:" in res.headers["content-security-policy"]
+    assert js.headers["content-type"].startswith("text/javascript")
+    assert "immutable" in js.headers["cache-control"]
+
+
+@pytest.mark.parametrize(("cookie", "precompute", "expected"), [(None, True, "mid"), ("low", True, "low"),
+                                                                ("bogus", True, "mid"), ("low", False, None)])
+def test_image_quality_for_render(cookie, precompute, expected):
+    config = Config()
+    config.image.precompute = precompute
+    renderer = FakeRenderer()
+    with make_client(renderer, config) as client:
+        if cookie:
+            client.cookies.set("lp_q", cookie)
+        open_page(client, "https://8.8.8.8/")
+    assert renderer.image_quality == expected
+
+
+class _ImageHandler(http.server.BaseHTTPRequestHandler):
+    routes: dict = {}
+
+    def do_GET(self):  # noqa: N802
+        ctype, body = self.routes.get(self.path, ("text/plain", b""))
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):  # noqa: A002
+        pass
+
+
+@pytest.fixture(scope="module")
+def image_server():
+    out = io.BytesIO()
+    Image.new("RGB", (1200, 600), (200, 30, 30)).save(out, "PNG")
+    _ImageHandler.routes = {"/a.png": ("image/png", out.getvalue()), "/page.html": ("text/html", b"<p>x</p>")}
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _ImageHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{server.server_address[1]}"
+    server.shutdown()
+
+
+def test_image_endpoint_serves_converted_image(image_server):
+    config = Config()
+    config.network.allow_private = True
+    with make_client(config=config) as client:
+        res = client.get("/i", params={"u": image_server + "/a.png", "q": "low"})
+        page = client.get("/i", params={"u": image_server + "/page.html", "q": "low"})
+    assert res.status_code == 200 and res.headers["content-type"] == "image/webp"
+    assert Image.open(io.BytesIO(res.content)).size == (320, 160)
+    assert "sandbox" in res.headers["content-security-policy"]
+    assert res.headers["cache-control"] == "private, max-age=86400"
+    assert page.status_code == 404  # 画像以外は返さない
+
+
+def test_image_endpoint_rejects_private_address(image_server):
+    with make_client() as client:
+        assert client.get("/i", params={"u": image_server + "/a.png"}).status_code == 403
 
 
 def test_get_form_is_forwarded():

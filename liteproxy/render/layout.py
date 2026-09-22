@@ -9,7 +9,7 @@ from ..stats import PageStats, compressed_size, human
 from ..templates import BAR_CSS, toolbar
 
 
-def finalize(snap: Snapshot, nonce: str) -> tuple[str, PageStats]:
+def finalize(snap: Snapshot, nonce: str, *, default_quality: str, client_src: str) -> tuple[str, PageStats]:
     """変換済みスナップショットにツールバーを差し込み、送信する HTML と統計を返す。"""
     gzip_bytes = compressed_size(snap.html)
     bar = toolbar(
@@ -18,12 +18,17 @@ def finalize(snap: Snapshot, nonce: str) -> tuple[str, PageStats]:
         sent=human(gzip_bytes),
         fetched=human(snap.pc_bytes),
         nonce=nonce,
+        sized_quality=snap.image_quality,
+        default_quality=default_quality,
+        client_src=client_src,
     )
     html = snap.html.replace("<!--lp-bar-->", bar, 1).replace("</head>", f"<style>{BAR_CSS}</style></head>", 1)
     stats = PageStats(
         url=snap.url,
         elapsed_ms=snap.elapsed_ms,
         transform_ms=snap.transform_ms,
+        image_ms=snap.image_ms,
+        image_count=snap.image_count,
         pc_bytes=snap.pc_bytes,
         requests=snap.requests,
         blocked=snap.blocked,

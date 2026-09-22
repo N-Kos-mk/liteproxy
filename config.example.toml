@@ -41,6 +41,13 @@ remove_selectors = [
   ".qc-cmp2-container",
 ]
 
+[image]
+# 画像はタップしたときだけ読み込む。画質: low（長辺 320px）/ mid（640px）/ high（画面の実ピクセル幅）/ orig（原本）
+default_quality = "mid"  # スマホ側で画質を選んでいないときの既定
+precompute = true        # 描画時に既定の画質へ変換し、画像の枠にサイズを表示する
+cache_mb = 256           # 元画像と変換結果を保持するメモリの上限
+max_image_mb = 20        # 1 枚あたりの取得上限
+
 [network]
 allow_private = false  # true にすると LAN・ループバック宛ての取得を許可する（テスト用）
 # PC 側での取得自体を止めるドメイン（サブドメインを含む）

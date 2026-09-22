@@ -18,7 +18,7 @@ class SlowRenderer:
     async def stop(self):
         pass
 
-    async def render(self, url, viewport, user_agent, on_stage=None):
+    async def render(self, url, viewport, user_agent, on_stage=None, image_quality=None):
         self.calls += 1
         on_stage("fetching")
         await self.release.wait()

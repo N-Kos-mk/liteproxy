@@ -25,6 +25,7 @@ from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from ..config import BrowserConfig, RenderConfig
+from ..media.image import ImageData, ImageStore
 from ..security import HostGuard
 from ..urls import FORM_ACTION_FIELD, FORM_CHARSET_FIELD, FORM_PATH, PROXY_PATH
 
@@ -98,6 +99,9 @@ class Snapshot:
     css_bytes: int
     elapsed_ms: int
     transform_ms: int  # elapsed_ms のうち transform.js の実行時間
+    image_ms: int = 0  # elapsed_ms のうち画像を既定の画質へ変換した時間
+    image_count: int = 0  # サイズを表示した画像の数
+    image_quality: str | None = None  # 表示したサイズの画質
 
 
 @dataclass
@@ -168,6 +172,33 @@ def _first_line(message: str) -> str:
     return message.strip().splitlines()[0] if message.strip() else "不明なエラー"
 
 
+async def _read_image(response: Response, store: ImageStore) -> None:
+    """Chrome が取得した画像を元データとして保持し、タップ時に再取得しないで済むようにする。"""
+    ctype = (response.headers.get("content-type") or "").split(";")[0].strip().lower()
+    length = response.headers.get("content-length", "")
+    if response.status != 200 or not ctype.startswith("image/"):
+        return
+    if length.isdigit() and int(length) > store.max_image_bytes:
+        return
+    try:
+        body = await response.body()
+    except PlaywrightError:
+        return
+    if len(body) > store.max_image_bytes:
+        return
+    data = ImageData(body, ctype)
+    request = response.request
+    while request is not None:
+        store.add_original(request.url, data)
+        request = request.redirected_from
+
+
+# 置き換え対象になる <img> の URL（描画時に既定の画質へ変換する対象）
+IMAGE_URLS_JS = """() => [...new Set([...document.images]
+  .map((i) => i.currentSrc || i.src)
+  .filter((u) => u && /^https?:/.test(u)))]"""
+
+
 async def _read_css(response: Response, sink: dict[str, str]) -> None:
     try:
         text = await response.text()
@@ -183,10 +214,17 @@ async def _read_css(response: Response, sink: dict[str, str]) -> None:
 class BrowserPool:
     """ヘッドレス Chrome を 1 つ起動しておき、要求ごとに独立したコンテキストで描画する。"""
 
-    def __init__(self, browser_cfg: BrowserConfig, render_cfg: RenderConfig, guard: HostGuard) -> None:
+    def __init__(
+        self,
+        browser_cfg: BrowserConfig,
+        render_cfg: RenderConfig,
+        guard: HostGuard,
+        images: ImageStore | None = None,
+    ) -> None:
         self._cfg = browser_cfg
         self._render_cfg = render_cfg
         self._guard = guard
+        self._images = images
         self._sem = asyncio.Semaphore(browser_cfg.max_concurrency)
         self._pw: Playwright | None = None
         self._browser: Browser | None = None
@@ -226,8 +264,12 @@ class BrowserPool:
         viewport: Viewport,
         user_agent: str | None,
         on_stage: StageCallback | None = None,
+        image_quality: str | None = None,
     ) -> Snapshot | NonHtml:
-        """on_stage には処理の段階（STAGE_*）が順に渡される。読み込み中画面の表示に使う。"""
+        """on_stage には処理の段階（STAGE_*）が順に渡される。読み込み中画面の表示に使う。
+
+        image_quality を渡すと、ページ内の画像をその画質へ変換しておき、画像の枠にサイズを表示する。
+        """
         stage = on_stage or (lambda _: None)
         stage(STAGE_QUEUED)
         async with self._sem:
@@ -247,17 +289,25 @@ class BrowserPool:
                 service_workers="block",
             )
             try:
-                return await self._render(context, url, started, stage)
+                return await self._render(context, url, started, stage, viewport, image_quality)
             finally:
                 with contextlib.suppress(PlaywrightError):
                     await context.close()
 
     async def _render(
-        self, context: BrowserContext, url: str, started: float, stage: StageCallback
+        self,
+        context: BrowserContext,
+        url: str,
+        started: float,
+        stage: StageCallback,
+        viewport: Viewport,
+        image_quality: str | None,
     ) -> Snapshot | NonHtml:
         net = _NetStats()
         css_texts: dict[str, str] = {}
         css_tasks: list[asyncio.Future] = []
+        image_tasks: list[asyncio.Future] = []
+        images = self._images
 
         async def route(route: Route) -> None:
             request = route.request
@@ -271,8 +321,11 @@ class BrowserPool:
                 pass  # ページを閉じた後に届いた要求
 
         def on_response(response: Response) -> None:
-            if response.request.resource_type == "stylesheet":
+            kind = response.request.resource_type
+            if kind == "stylesheet":
                 css_tasks.append(asyncio.ensure_future(_read_css(response, css_texts)))
+            elif kind == "image" and images is not None:
+                image_tasks.append(asyncio.ensure_future(_read_image(response, images)))
 
         await context.route("**/*", route)
         page = await context.new_page()
@@ -319,6 +372,19 @@ class BrowserPool:
         if css_tasks:
             await asyncio.gather(*css_tasks, return_exceptions=True)
 
+        stage(STAGE_TRANSFORMING)
+        image_sizes: dict[str, int] = {}
+        image_started = time.perf_counter()
+        if image_tasks:
+            await asyncio.gather(*image_tasks, return_exceptions=True)
+        if images is not None and image_quality:
+            try:
+                urls = await page.evaluate(IMAGE_URLS_JS)
+            except PlaywrightError:
+                urls = []
+            image_sizes = await images.prepare(urls, image_quality, round(viewport.width * viewport.dpr))
+        image_ms = round((time.perf_counter() - image_started) * 1000)
+
         origin = _origin(page.url)
         rc = self._render_cfg
         args = {
@@ -331,8 +397,8 @@ class BrowserPool:
             "maxInlineSvg": rc.max_inline_svg,
             "maxDataUri": rc.max_data_uri,
             "pruneClasses": rc.prune_classes,
+            "imageSizes": image_sizes,
         }
-        stage(STAGE_TRANSFORMING)
         transform_started = time.perf_counter()
         try:
             result = await page.evaluate(TRANSFORM_JS, args)
@@ -350,4 +416,7 @@ class BrowserPool:
             css_bytes=result["cssBytes"],
             elapsed_ms=round((time.perf_counter() - started) * 1000),
             transform_ms=transform_ms,
+            image_ms=image_ms,
+            image_count=len(image_sizes),
+            image_quality=image_quality if image_sizes else None,
         )

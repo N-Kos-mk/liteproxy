@@ -24,7 +24,12 @@ class Renderer(Protocol):
     async def start(self) -> None: ...
     async def stop(self) -> None: ...
     async def render(
-        self, url: str, viewport: Viewport, user_agent: str | None, on_stage: StageCallback | None = None
+        self,
+        url: str,
+        viewport: Viewport,
+        user_agent: str | None,
+        on_stage: StageCallback | None = None,
+        image_quality: str | None = None,
     ) -> Snapshot | NonHtml: ...
 
 
@@ -35,6 +40,7 @@ class RenderKey:
     url: str
     viewport: Viewport
     user_agent: str
+    image_quality: str | None = None  # 画像の枠に表示するサイズの画質（None なら表示しない）
 
 
 class Job:
@@ -135,7 +141,9 @@ class RenderJobs:
     async def _run(self, job: Job) -> None:
         key = job.key
         try:
-            result = await self._renderer.render(key.url, key.viewport, key.user_agent, on_stage=job.set_stage)
+            result = await self._renderer.render(
+                key.url, key.viewport, key.user_agent, on_stage=job.set_stage, image_quality=key.image_quality
+            )
         except RenderError as e:
             job.fail(str(e))
         except asyncio.CancelledError:

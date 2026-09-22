@@ -17,6 +17,7 @@
     maxInlineSvg,
     maxDataUri,
     pruneClasses,
+    imageSizes, // 既定の画質へ変換した後の送信サイズ { 画像URL: バイト数 }
   } = args;
 
   const pageURL = location.href.split('#')[0];
@@ -240,14 +241,17 @@
     );
   }
 
-  // 表示サイズに合わせて、スマホ上でおよそ 11px に見える文字サイズとラベルを決める
-  function label(text, fallback, dispW, dispH, svgW) {
+  const kb = (n) => (n < 1024 ? `${n}B` : `${(n / 1024).toFixed(n < 10240 ? 1 : 0)}KB`);
+
+  // 表示サイズに合わせて、スマホ上でおよそ 11px に見える文字サイズとラベルを決める。
+  // suffix（送信サイズ）は削らずに残し、長すぎる場合は本文側を省略する
+  function label(text, fallback, dispW, dispH, svgW, suffix = '') {
     if (dispW < 40 || dispH < 16) return [null, 0];
     const scale = svgW > 0 ? svgW / dispW : 1;
     const t0 = (text || '').replace(/\s+/g, ' ').trim() || fallback;
-    const max = Math.max(2, Math.floor(dispW / 12) - 1);
-    const t = t0.length > max ? t0.slice(0, max - 1) + '…' : t0;
-    return [t, Math.max(1, Math.round(11 * scale))];
+    const max = Math.max(2, Math.floor(dispW / 12) - 1 - (suffix ? suffix.length / 2 + 1 : 0));
+    const t = t0.length > max ? t0.slice(0, Math.max(1, max - 1)) + '…' : t0;
+    return [suffix ? `${t} ${suffix}` : t, Math.max(1, Math.round(11 * scale))];
   }
 
   function img(l, c) {
@@ -268,8 +272,16 @@
     }
     w = Math.round(w);
     h = Math.round(h);
-    if (src && !src.startsWith('data:')) c.setAttribute('data-lp-src', src);
-    const [t, font] = label(c.getAttribute('alt'), '画像', rect.width, rect.height, w);
+    let suffix = '';
+    if (src && !src.startsWith('data:')) {
+      c.setAttribute('data-lp-src', src);
+      const size = imageSizes[src];
+      if (size != null) {
+        c.setAttribute('data-lp-size', String(size));
+        suffix = kb(size);
+      }
+    }
+    const [t, font] = label(c.getAttribute('alt'), '画像', rect.width, rect.height, w, suffix);
     c.setAttribute('src', placeholder(w, h, t, font));
   }
 

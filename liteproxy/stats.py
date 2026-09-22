@@ -30,6 +30,8 @@ class PageStats:
     url: str
     elapsed_ms: int
     transform_ms: int
+    image_ms: int
+    image_count: int
     pc_bytes: int
     requests: int
     blocked: int
@@ -46,10 +48,12 @@ class StatsLog:
 
     def write(self, stats: PageStats) -> None:
         log.info(
-            "%s %dms(変換 %dms) PC取得=%s 送信=%s(gzip %s) CSS=%s",
+            "%s %dms(変換 %dms, 画像 %d枚 %dms) PC取得=%s 送信=%s(gzip %s) CSS=%s",
             stats.url,
             stats.elapsed_ms,
             stats.transform_ms,
+            stats.image_count,
+            stats.image_ms,
             human(stats.pc_bytes),
             human(stats.html_bytes),
             human(stats.gzip_bytes),

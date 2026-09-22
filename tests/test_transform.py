@@ -10,17 +10,21 @@ import asyncio
 import functools
 import http.server
 import os
+import random
 import re
 import threading
 from urllib.parse import quote
 
 import pytest
+from PIL import Image
 
 from liteproxy.browser.pool import BrowserPool, Snapshot, Viewport
 from liteproxy.config import BrowserConfig, RenderConfig
+from liteproxy.media.image import ImageStore
 from liteproxy.security import HostGuard
 
 BIG_PATH = "M0 0" + " L1 1" * 800
+SITE_ROOT: list[str] = []
 
 PAGE = """<!doctype html>
 <html lang="ja" class="js-root">
@@ -58,6 +62,7 @@ PAGE = """<!doctype html>
 <p class="used jsonly-hook">テキスト</p>
 <div class="card bg spinner icon" data-state="open" data-tracking="abc" onclick="alert(1)">カード</div>
 <img id="i1" src="/img.svg" alt="説明" width="200" height="100">
+<img id="i4" src="/photo.jpg" alt="写真">
 <img id="i2" src="/img.svg" srcset="/img.svg 1x, /img2.svg 2x" alt="">
 <picture><source srcset="/img2.svg" media="(min-width: 1px)"><img id="i3" src="/img.svg" alt=""></picture>
 <a id="l1" href="/next.html?a=1">次へ</a>
@@ -109,6 +114,7 @@ def _serve(directory: str) -> http.server.ThreadingHTTPServer:
 @pytest.fixture(scope="module")
 def site(tmp_path_factory):
     root = tmp_path_factory.mktemp("site")
+    SITE_ROOT[:] = [str(root)]
     main = _serve(str(root))
     cross = _serve(str(root))  # ポート違い = 別オリジン
     port, port2 = main.server_address[1], cross.server_address[1]
@@ -125,6 +131,9 @@ def site(tmp_path_factory):
         "<svg xmlns='http://www.w3.org/2000/svg' width='800' height='400'></svg>", encoding="utf-8"
     )
     (root / "frame.html").write_text("<p>frame</p>", encoding="utf-8")
+    rnd = random.Random(0)
+    noise = bytes(rnd.getrandbits(8) for _ in range(800 * 400 * 3))
+    Image.frombytes("RGB", (800, 400), noise).save(root / "photo.jpg", "JPEG", quality=90)
     yield port
     main.shutdown()
     cross.shutdown()
@@ -132,17 +141,19 @@ def site(tmp_path_factory):
 
 def _render(url: str) -> Snapshot:
     async def run():
+        guard = HostGuard(allow_private=True)
         pool = BrowserPool(
             BrowserConfig(channel=os.environ.get("LITEPROXY_TEST_CHANNEL", "chrome"), settle_timeout_ms=2000),
             RenderConfig(),
-            HostGuard(allow_private=True),
+            guard,
+            ImageStore(guard),
         )
         try:
             await pool.start()
         except Exception as e:  # noqa: BLE001
             pytest.skip(f"ブラウザを起動できません: {e}")
         try:
-            return await pool.render(url, Viewport(390, 844, 2, False), None)
+            return await pool.render(url, Viewport(390, 844, 2, False), None, image_quality="low")
         finally:
             await pool.stop()
 
@@ -250,3 +261,16 @@ def test_shift_jis_page(site):
     assert "日本語テキスト" in snap.html
     assert '<meta charset="utf-8">' in snap.html
     assert 'name="__lp_charset" value="Shift_JIS"' in snap.html
+
+
+def test_image_sizes_are_precomputed(snap, site):
+    photo = _tag(snap.html, "img", "i4")
+    size = int(re.search(r'data-lp-size="(\d+)"', photo).group(1))
+    original = os.path.getsize(os.path.join(SITE_ROOT[0], "photo.jpg"))
+    assert 0 < size < original  # 低画質の WebP に変換した後のサイズ
+    assert "KB" in photo  # 枠にサイズを表示する
+    # 変換できない SVG は元のサイズをそのまま表示する
+    svg = _tag(snap.html, "img", "i1")
+    svg_size = os.path.getsize(os.path.join(SITE_ROOT[0], "img.svg"))
+    assert f'data-lp-size="{svg_size}"' in svg
+    assert snap.image_quality == "low" and snap.image_count >= 2

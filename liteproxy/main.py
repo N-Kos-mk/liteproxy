@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from urllib.parse import quote, quote_plus
 
 import jwt
@@ -18,6 +20,7 @@ from . import templates
 from .browser import BrowserPool, NonHtml, Snapshot, Viewport
 from .config import BrowserConfig, Config
 from .jobs import Job, Renderer, RenderJobs, RenderKey
+from .media.image import QUALITY_LABELS, ImageStore
 from .render import layout
 from .security import AccessVerifier, HostGuard
 from .stats import StatsLog, human
@@ -32,11 +35,18 @@ from .urls import (
 
 log = logging.getLogger(__name__)
 
-# 変換漏れがあってもスマホ側で外部への通信が起きないようにする安全網
+# 変換漏れがあってもスマホ側で外部への通信が起きないようにする安全網。
+# 読み込めるのは liteproxy 自身の画像（/i）と JS（/static）だけにする
 _CSP = (
-    "default-src 'none'; img-src data:; style-src 'unsafe-inline'; script-src 'nonce-{nonce}'; "
+    "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; script-src 'self' 'nonce-{nonce}'; "
     "frame-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
 )
+# /i は取得した画像をそのまま返すことがあるため、SVG 内のスクリプトなどが動かないようにする
+_IMAGE_CSP = "default-src 'none'; style-src 'unsafe-inline'; sandbox"
+
+_CLIENT_JS = (Path(__file__).parent / "static" / "client.js").read_bytes()
+# 内容が変わったら URL も変わるようにし、スマホ側には長期間キャッシュさせる
+CLIENT_SRC = f"/static/client.js?v={hashlib.sha256(_CLIENT_JS).hexdigest()[:10]}"
 
 
 # 読み込み中画面へ、段階に変化がなくてもこの間隔で生存通知を送る
@@ -110,7 +120,10 @@ def create_app(
     verifier: AccessVerifier | None = None,
 ) -> FastAPI:
     guard = HostGuard(allow_private=config.network.allow_private, block_domains=config.network.block_domains)
-    pool: Renderer = renderer or BrowserPool(config.browser, config.render, guard)
+    mb = 1024 * 1024
+    images = ImageStore(guard, cache_bytes=config.image.cache_mb * mb, max_image_bytes=config.image.max_image_mb * mb)
+    pool: Renderer = renderer or BrowserPool(config.browser, config.render, guard, images)
+    default_quality = config.image.default_quality
     stats_log = StatsLog(config.log.stats_file)
     if verifier is None and config.access.enabled:
         verifier = AccessVerifier(config.access.team_domain, config.access.aud, config.access.allowed_emails)
@@ -118,15 +131,21 @@ def create_app(
     def on_complete(job: Job, result: Snapshot | NonHtml) -> int | None:
         if isinstance(result, NonHtml):
             return None
-        _, stats = layout.finalize(result, nonce="")
+        _, stats = layout.finalize(result, nonce="", default_quality=default_quality, client_src=CLIENT_SRC)
         stats_log.write(stats)
         return stats.gzip_bytes
 
     jobs = RenderJobs(pool, on_complete=on_complete)
 
+    def image_quality(request: Request) -> str:
+        q = request.cookies.get("lp_q", "")
+        return q if q in QUALITY_LABELS else default_quality
+
     def render_key(request: Request, target: str) -> RenderKey:
         viewport = viewport_from_cookie(request.cookies.get("lp_env"), config.browser)
-        return RenderKey(target, viewport, request.headers.get("user-agent", ""))
+        # 画像の枠に表示するサイズは画質ごとに異なるため、画質も描画条件に含める
+        quality = image_quality(request) if config.image.precompute else None
+        return RenderKey(target, viewport, request.headers.get("user-agent", ""), quality)
 
     def result_response(result: Snapshot | NonHtml) -> Response:
         nonce = secrets.token_urlsafe(12)
@@ -134,7 +153,7 @@ def create_app(
             size = human(result.size) if result.size is not None else "不明"
             page = templates.non_html_page(result.url, result.content_type, size, nonce)
             return html_response(page, nonce=nonce)
-        html, _ = layout.finalize(result, nonce)
+        html, _ = layout.finalize(result, nonce, default_quality=default_quality, client_src=CLIENT_SRC)
         return html_response(html, nonce=nonce, max_age=300, language=None)
 
     @asynccontextmanager
@@ -169,6 +188,41 @@ def create_app(
     async def home() -> HTMLResponse:
         nonce = secrets.token_urlsafe(12)
         return html_response(templates.home(nonce), nonce=nonce)
+
+    @app.get("/static/client.js")
+    async def client_js() -> Response:
+        return Response(
+            _CLIENT_JS,
+            media_type="text/javascript; charset=utf-8",
+            headers={"Cache-Control": "private, max-age=31536000, immutable", "X-Content-Type-Options": "nosniff"},
+        )
+
+    @app.get("/i")
+    async def image(request: Request, u: str = "", q: str = "", r: str = "") -> Response:
+        """画像の枠がタップされたときに、選ばれた画質の画像を返す。"""
+        if not await guard.allowed(u):
+            return PlainTextResponse("Forbidden", status_code=403)
+        quality = q if q in QUALITY_LABELS else image_quality(request)
+        viewport = viewport_from_cookie(request.cookies.get("lp_env"), config.browser)
+        referer = r if r.startswith(("http://", "https://")) else None
+        data = await images.variant(
+            u,
+            quality,
+            round(viewport.width * viewport.dpr),
+            referer=referer,
+            user_agent=request.headers.get("user-agent"),
+        )
+        if data is None:
+            return PlainTextResponse("Not Found", status_code=404)
+        return Response(
+            data.body,
+            media_type=data.content_type,
+            headers={
+                "Cache-Control": "private, max-age=86400",
+                "Content-Security-Policy": _IMAGE_CSP,
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
 
     @app.get("/favicon.ico")
     async def favicon() -> Response:
