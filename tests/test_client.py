@@ -15,12 +15,18 @@ from PIL import Image
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import sync_playwright
 
+from liteproxy.templates import BAR_CSS
+
 CLIENT_JS = (Path(__file__).resolve().parent.parent / "liteproxy" / "static" / "client.js").read_text(encoding="utf-8")
 PLACEHOLDER = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='400' height='200'%3E%3C/svg%3E"
-PAGE = f"""<!DOCTYPE html><html><head><meta charset="utf-8"></head><body>
+PAGE = f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<style>{BAR_CSS}</style>
+<style>#c {{ width: 40px; }} #tall {{ height: 3000px; }}</style></head><body>
 <lp-bar data-page="https://e.com/article" data-q="mid" data-dq="mid"><button type="button" id="lp-img">画像</button></lp-bar>
 <img id="a" src="{PLACEHOLDER}" data-lp-src="https://e.com/a.jpg" data-lp-size="12345" alt="写真A">
 <a id="link" href="/next"><img id="b" src="{PLACEHOLDER}" data-lp-src="https://e.com/b.jpg" alt=""></a>
+<img id="c" src="{PLACEHOLDER}" data-lp-src="https://e.com/c.jpg" alt="">
+<div id="tall"></div>
 <script src="/static/client.js"></script>
 </body></html>"""
 
@@ -95,12 +101,12 @@ def test_image_in_link_loads_first_then_follows_link(page):
 def test_load_all_from_toolbar(page):
     page.click("#lp-img")
     sheet = page.locator("lp-sheet")
-    assert "未読み込み 2 枚" in sheet.inner_text()
+    assert "未読み込み 3 枚" in sheet.inner_text()
     assert "約12KB以上" in sheet.inner_text()  # サイズが分かる画像の合計（分からないものがあるため「以上」）
     page.get_by_text("すべて読み込む").click()
     wait_loaded(page, "#a")
     wait_loaded(page, "#b")
-    assert sorted(r["u"] for r in page.requested) == ["https://e.com/a.jpg", "https://e.com/b.jpg"]
+    assert sorted(r["u"] for r in page.requested) == ["https://e.com/a.jpg", "https://e.com/b.jpg", "https://e.com/c.jpg"]
 
 
 def test_default_quality_is_saved_in_cookie(page):
@@ -117,3 +123,29 @@ def test_long_press_menu_selects_quality(page):
     page.locator("lp-sheet button", has_text="原本").click()
     wait_loaded(page, "#a")
     assert page.requested == [{"u": "https://e.com/a.jpg", "q": "orig", "r": "https://e.com/article"}]
+
+
+def test_size_is_preserved_when_layout_depends_on_the_image(page):
+    """寸法の指定がない画像は、低画質で固有サイズが小さくなっても表示サイズを保つ。"""
+    before = page.evaluate("document.getElementById('a').getBoundingClientRect().height")
+    page.click("#a")
+    wait_loaded(page, "#a")
+    assert page.evaluate("document.getElementById('a').naturalHeight") == 160  # 受け取った画像は小さい
+    assert page.evaluate("document.getElementById('a').getBoundingClientRect().height") == before == 200
+
+
+def test_site_specified_size_is_not_overwritten(page):
+    """幅だけを指定し高さを縦横比から決めているサイトで、高さを固定して崩さない。"""
+    assert page.evaluate("getComputedStyle(document.getElementById('c')).height") == "20px"
+    page.click("#c")
+    wait_loaded(page, "#c")
+    assert page.evaluate("getComputedStyle(document.getElementById('c')).height") == "20px"
+    assert page.get_attribute("#c", "height") is None
+    assert page.get_attribute("#c", "style") is None
+
+
+def test_toolbar_stays_at_the_top_while_scrolling(page):
+    page.evaluate("scrollTo(0, 1200)")
+    page.wait_for_timeout(100)
+    assert page.evaluate("scrollY") > 1000
+    assert page.evaluate("Math.round(document.querySelector('lp-bar').getBoundingClientRect().top)") == 0

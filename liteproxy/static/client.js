@@ -49,24 +49,44 @@
   const pending = () =>
     [...document.querySelectorAll('img[data-lp-src]')].filter((i) => i.dataset.lpState !== 'done');
 
-  // 枠と同じ寸法を保つ。低画質の画像は固有サイズが小さいため、属性がないとレイアウトが変わる
-  function keepSize(img) {
-    if (img.dataset.lpState !== 'done' && !img.hasAttribute('width') && img.naturalWidth) {
-      img.setAttribute('width', img.naturalWidth);
-      img.setAttribute('height', img.naturalHeight);
+  // 差し替えで表示サイズが変わったときだけ、元の寸法に合わせ直す。
+  // 低画質の画像は固有サイズが小さいため、サイトが寸法を指定していないと縮んでしまう。
+  // 逆に、幅だけを指定して高さを縦横比から決めているサイトでは、先に寸法を固定すると崩れる
+  function fitSize(img, before) {
+    if (img.dataset.lpFit) return;
+    const changed = () => {
+      const r = img.getBoundingClientRect();
+      return Math.abs(r.width - before.width) > 1 || Math.abs(r.height - before.height) > 1;
+    };
+    if (!changed()) return;
+    img.dataset.lpFit = '1';
+    const w = Math.round(before.width);
+    const h = Math.round(before.height);
+    if (!img.hasAttribute('width') && !img.hasAttribute('height')) {
+      img.setAttribute('width', w);
+      img.setAttribute('height', h);
     }
+    if (changed()) img.setAttribute('style', (img.getAttribute('style') || '') + `;width:${w}px;height:${h}px`);
+  }
+
+  // 差し替え後の寸法は読み込みが終わってから決まるため、load を待って補正する
+  function swap(img, src) {
+    const before = img.getBoundingClientRect();
+    const fix = () => fitSize(img, before);
+    img.addEventListener('load', fix, { once: true });
+    img.src = src;
+    setTimeout(fix, 300);
   }
 
   function load(img, q) {
     if (img.dataset.lpState === 'loading') return;
-    keepSize(img);
     const lpSrc = img.dataset.lpSrc;
     const src = '/i?u=' + encodeURIComponent(lpSrc) + '&q=' + q + (page ? '&r=' + encodeURIComponent(page) : '');
     img.dataset.lpState = 'loading';
     // 読み込み中に壊れた画像の表示にならないよう、別の Image で読み込んでから差し替える
     const probe = new Image();
     probe.onload = () => {
-      img.src = src;
+      swap(img, src);
       img.dataset.lpState = 'done';
       img.dataset.lpQ = q;
       loaded.set(lpSrc, { src, q });
@@ -84,8 +104,7 @@
     for (const img of imgs) {
       const hit = loaded.get(img.dataset.lpSrc);
       if (!hit || img.dataset.lpState === 'done') continue;
-      keepSize(img);
-      img.src = hit.src;
+      swap(img, hit.src);
       img.dataset.lpState = 'done';
       img.dataset.lpQ = hit.q;
     }

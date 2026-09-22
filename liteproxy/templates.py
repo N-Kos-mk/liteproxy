@@ -26,7 +26,9 @@ _BASE_CSS = (
 )
 
 BAR_CSS = (
-    "lp-bar{all:initial;display:flex;gap:10px;align-items:center;padding:3px 8px;"
+    # スクロールしても上端に残す。fixed ではなく sticky なので、ページの内容の位置はずれない
+    "lp-bar{all:initial;position:sticky;top:0;z-index:2147483646;display:flex;gap:10px;align-items:center;"
+    "padding:3px 8px;"
     "background:#1f2328;color:#d0d7de;font:12px/1.7 system-ui,sans-serif;white-space:nowrap;overflow:hidden}"
     "lp-bar *{all:unset}"
     "lp-bar a,lp-bar button{color:#79c0ff;cursor:pointer}"
