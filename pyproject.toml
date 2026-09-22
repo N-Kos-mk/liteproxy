@@ -1,0 +1,22 @@
+[project]
+name = "liteproxy"
+version = "0.1.0"
+description = "通信制限下のスマートフォン向けに、Webページを自宅PCで描画・軽量化して中継するプロキシ"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "playwright>=1.48",
+    "pyjwt[crypto]>=2.9",
+]
+
+[dependency-groups]
+dev = [
+    "httpx2>=2.13.0",
+    "pytest>=8",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
