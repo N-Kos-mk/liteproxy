@@ -52,8 +52,14 @@ _CSP = (
 )
 # /i は取得した画像をそのまま返すことがあるため、SVG 内のスクリプトなどが動かないようにする
 _IMAGE_CSP = "default-src 'none'; style-src 'unsafe-inline'; sandbox"
-# ホームだけ、PWA の manifest と Service Worker の登録を許可する（default-src 'none' はどちらにもフォールバックしない）
-_HOME_CSP = _CSP + "; manifest-src 'self'; worker-src 'self'"
+# ホームと /app（シェル）だけ、PWA の manifest と Service Worker の登録を許可する
+# （default-src 'none' はどちらにもフォールバックしないため明示が必要）
+_PWA_CSP = _CSP + "; manifest-src 'self'; worker-src 'self'"
+# 中継ページを iframe に埋め込めるよう、埋め込みが確認できたときだけ frame-ancestors を緩める。
+# frame-src 'self' は既存の _CSP に既にある（元ページ内の iframe を残す機能のため）ので変更不要
+_CSP_EMBEDDABLE = _CSP.replace("frame-ancestors 'none'", "frame-ancestors 'self'")
+# ホーム（/）は /app のシェルが最初に iframe へ読み込む先でもあるため、埋め込み時だけ frame-ancestors を緩める
+_PWA_CSP_EMBEDDABLE = _CSP_EMBEDDABLE + "; manifest-src 'self'; worker-src 'self'"
 
 _CLIENT_JS = (Path(__file__).parent / "static" / "client.js").read_bytes()
 # 内容が変わったら URL も変わるようにし、スマホ側には長期間キャッシュさせる
@@ -68,7 +74,7 @@ _MANIFEST = json.dumps(
     {
         "name": "liteproxy",
         "short_name": "liteproxy",
-        "start_url": "/",
+        "start_url": "/app",
         "display": "standalone",
         "background_color": "#1f2328",
         "theme_color": "#1f2328",
@@ -82,7 +88,7 @@ _MANIFEST = json.dumps(
 
 # ホーム画面（外枠）だけをキャッシュする。/p・/v・/a・/i・/s・/f などの中継結果は
 # 古い内容をオフライン時に誤って返さないよう、対象に含めない。
-_SW_ASSETS = ["/", CLIENT_SRC, "/manifest.json", ICON_192_SRC, ICON_512_SRC]
+_SW_ASSETS = ["/", "/app", CLIENT_SRC, "/manifest.json", ICON_192_SRC, ICON_512_SRC]
 # 中身が変わったら Service Worker のテキスト自体も変わるようにし、ブラウザに再インストールさせる
 _SW_CACHE = "lp-" + hashlib.sha256("".join(_SW_ASSETS).encode()).hexdigest()[:10]
 _SERVICE_WORKER = f"""\
@@ -144,15 +150,34 @@ def viewport_from_cookie(value: str | None, cfg: BrowserConfig) -> Viewport:
         return default
 
 
+def is_embedded(request: Request) -> bool:
+    """/app のシェルが iframe として埋め込んでいるかを、ブラウザが自動付与する（JS からは偽装できない）
+    Fetch Metadata ヘッダーで判定する。無ければ安全側（今までどおりツールバー表示・埋め込み不可）に倒す。"""
+    return (
+        request.headers.get("sec-fetch-dest") == "iframe"
+        and request.headers.get("sec-fetch-site") in ("same-origin", "none")
+    )
+
+
 def page_headers(
-    *, nonce: str, cache_control: str = "no-store", language: str | None = "ja", csp: str | None = None
+    *,
+    nonce: str,
+    cache_control: str = "no-store",
+    language: str | None = "ja",
+    csp: str | None = None,
+    embed: bool = False,
 ) -> dict[str, str]:
     """language は liteproxy 自身のページの言語。中継したページでは元の言語に任せるため None にする。
 
-    csp を渡すと既定の _CSP の代わりに使う（home() だけ manifest-src/worker-src を足すため）。
+    csp を渡すと既定の代わりに使う（home()/app() だけ manifest-src/worker-src を足すため）。
+    embed は csp を渡さないときだけ効き、iframe に埋め込まれたときだけ frame-ancestors を緩める。
     """
+    if csp is not None:
+        resolved_csp = csp
+    else:
+        resolved_csp = (_CSP_EMBEDDABLE if embed else _CSP).format(nonce=nonce)
     headers = {
-        "Content-Security-Policy": csp if csp is not None else _CSP.format(nonce=nonce),
+        "Content-Security-Policy": resolved_csp,
         "Referrer-Policy": "no-referrer",
         "X-Content-Type-Options": "nosniff",
         "X-Robots-Tag": "noindex, nofollow",
@@ -160,6 +185,10 @@ def page_headers(
     }
     if language:
         headers["Content-Language"] = language
+    # embed の有無でレスポンス内容（frame-ancestors・ツールバーの表示）が変わるため、
+    # スマホ側の HTTP キャッシュが埋め込み/非埋め込みの応答を取り違えないようにする
+    if cache_control.startswith("private, max-age"):
+        headers["Vary"] = "Sec-Fetch-Dest, Sec-Fetch-Site"
     return headers
 
 
@@ -171,10 +200,11 @@ def html_response(
     max_age: int = 0,
     language: str | None = "ja",
     csp: str | None = None,
+    embed: bool = False,
 ) -> HTMLResponse:
     # 戻る操作で再取得しないよう、スマホのブラウザに短時間キャッシュさせる
     cache_control = f"private, max-age={max_age}" if max_age else "no-store"
-    headers = page_headers(nonce=nonce, cache_control=cache_control, language=language, csp=csp)
+    headers = page_headers(nonce=nonce, cache_control=cache_control, language=language, csp=csp, embed=embed)
     return HTMLResponse(body, status_code=status, headers=headers)
 
 
@@ -241,14 +271,16 @@ def create_app(
             target, viewport, request.headers.get("user-agent", ""), quality, mode or page_mode(request)
         )
 
-    def result_response(result: Snapshot | NonHtml) -> Response:
+    def result_response(result: Snapshot | NonHtml, *, embed: bool = False) -> Response:
         nonce = secrets.token_urlsafe(12)
         if isinstance(result, NonHtml):
             size = human(result.size) if result.size is not None else "不明"
             page = templates.non_html_page(result.url, result.content_type, size, nonce)
-            return html_response(page, nonce=nonce)
-        html, _ = layout.finalize(result, nonce, default_quality=default_quality, client_src=CLIENT_SRC)
-        return html_response(html, nonce=nonce, max_age=300, language=None)
+            return html_response(page, nonce=nonce, embed=embed)
+        html, _ = layout.finalize(
+            result, nonce, default_quality=default_quality, client_src=CLIENT_SRC, embed=embed
+        )
+        return html_response(html, nonce=nonce, max_age=300, language=None, embed=embed)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -279,12 +311,24 @@ def create_app(
             return await call_next(request)
 
     @app.get("/")
-    async def home() -> HTMLResponse:
+    async def home(request: Request) -> HTMLResponse:
         nonce = secrets.token_urlsafe(12)
+        # /app のシェルが最初に読み込む iframe の src でもあるため、埋め込み時は frame-ancestors を緩める
+        csp = _PWA_CSP_EMBEDDABLE if is_embedded(request) else _PWA_CSP
         return html_response(
             templates.home(nonce, icon_src=ICON_192_SRC),
             nonce=nonce,
-            csp=_HOME_CSP.format(nonce=nonce),
+            csp=csp.format(nonce=nonce),
+        )
+
+    @app.get("/app")
+    async def app_shell() -> HTMLResponse:
+        """外枠（アドレス欄・戻る/進む）。中身は iframe で /p・/v を表示する。"""
+        nonce = secrets.token_urlsafe(12)
+        return html_response(
+            templates.shell(nonce, icon_src=ICON_192_SRC),
+            nonce=nonce,
+            csp=_PWA_CSP.format(nonce=nonce),
         )
 
     @app.get("/static/client.js")
@@ -373,6 +417,7 @@ def create_app(
         f=1 なら保持している結果を使わずに描画し直す（PC 側のページが失われた場合など）。
         """
         nonce = secrets.token_urlsafe(12)
+        embed = is_embedded(request)
 
         def keep_mode(response: Response) -> Response:
             if m in MODES:
@@ -386,13 +431,13 @@ def create_app(
         target = unwrap_redirector(target)
         if not await guard.allowed(target):
             message = "このURLは開けません（内部ネットワーク宛て、またはブロック対象のドメインです）。"
-            return html_response(templates.error_page(message, nonce), nonce=nonce, status=403)
+            return html_response(templates.error_page(message, nonce), nonce=nonce, status=403, embed=embed)
 
         key = render_key(request, target, page_mode(request, m))
         force = f == "1"
         cached = None if force else jobs.cached(key)
         if cached is not None:
-            return keep_mode(result_response(cached))
+            return keep_mode(result_response(cached, embed=embed))
         # 描画を待たずに読み込み中画面を返し、進捗を流し続ける。完了したら /v へ移動させる。
         # no-transform は Cloudflare に圧縮・加工させず、進捗をため込まずに届けるため
         job = jobs.start(key, force=force)
@@ -400,7 +445,7 @@ def create_app(
             StreamingResponse(
                 loader_stream(job, target, nonce),
                 media_type="text/html",
-                headers=page_headers(nonce=nonce, cache_control="no-store, no-transform"),
+                headers=page_headers(nonce=nonce, cache_control="no-store, no-transform", embed=embed),
             )
         )
 
@@ -416,7 +461,7 @@ def create_app(
             result = jobs.cached(render_key(request, target))
         if result is None:
             return RedirectResponse(proxy_url(target), status_code=303)
-        return result_response(result)
+        return result_response(result, embed=is_embedded(request))
 
     @app.post("/a")
     async def act(request: Request) -> Response:
@@ -484,7 +529,12 @@ def create_app(
                 fields.append((key, value))
         if normalize_input(action) is None:
             nonce = secrets.token_urlsafe(12)
-            return html_response(templates.error_page("フォームの送信先が不正です。", nonce), nonce=nonce, status=400)
+            return html_response(
+                templates.error_page("フォームの送信先が不正です。", nonce),
+                nonce=nonce,
+                status=400,
+                embed=is_embedded(request),
+            )
         return RedirectResponse(proxy_url(build_form_target(action, fields, charset)), status_code=303)
 
     @app.post("/f")
@@ -497,6 +547,8 @@ def create_app(
             action = (await request.form()).get(FORM_ACTION_FIELD, "")
         message = "PC側のページが保持されていないため、この送信はできません。ページを開き直してから送信してください。"
         target = normalize_input(action) if isinstance(action, str) else None
-        return html_response(templates.error_page(message, nonce, target=target), nonce=nonce, status=409)
+        return html_response(
+            templates.error_page(message, nonce, target=target), nonce=nonce, status=409, embed=is_embedded(request)
+        )
 
     return app

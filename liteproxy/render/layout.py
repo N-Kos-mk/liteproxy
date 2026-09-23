@@ -9,8 +9,13 @@ from ..stats import PageStats, compressed_size, human
 from ..templates import BAR_CSS, toolbar
 
 
-def finalize(snap: Snapshot, nonce: str, *, default_quality: str, client_src: str) -> tuple[str, PageStats]:
-    """変換済みスナップショット（layout / reader）にツールバーを差し込み、送信する HTML と統計を返す。"""
+def finalize(
+    snap: Snapshot, nonce: str, *, default_quality: str, client_src: str, embed: bool = False
+) -> tuple[str, PageStats]:
+    """変換済みスナップショット（layout / reader）にツールバーを差し込み、送信する HTML と統計を返す。
+
+    embed が真のときは /app のシェルが iframe に埋め込んでいるため、ツールバーを隠して差し込む。
+    """
     gzip_bytes = compressed_size(snap.html)
     bar = toolbar(
         title=snap.title or urlsplit(snap.url).hostname or snap.url,
@@ -24,6 +29,7 @@ def finalize(snap: Snapshot, nonce: str, *, default_quality: str, client_src: st
         session_id=snap.session_id,
         rev=snap.rev,
         mode=snap.mode,
+        embed=embed,
     )
     # liteproxy が足す要素には data-lp-x を付け、操作の差分で要素の位置を数えるときに除く
     html = snap.html.replace("<!--lp-bar-->", bar, 1).replace(
