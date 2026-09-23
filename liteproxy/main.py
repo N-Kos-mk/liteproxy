@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import secrets
 from collections.abc import AsyncIterator
@@ -51,10 +52,72 @@ _CSP = (
 )
 # /i は取得した画像をそのまま返すことがあるため、SVG 内のスクリプトなどが動かないようにする
 _IMAGE_CSP = "default-src 'none'; style-src 'unsafe-inline'; sandbox"
+# ホームだけ、PWA の manifest と Service Worker の登録を許可する（default-src 'none' はどちらにもフォールバックしない）
+_HOME_CSP = _CSP + "; manifest-src 'self'; worker-src 'self'"
 
 _CLIENT_JS = (Path(__file__).parent / "static" / "client.js").read_bytes()
 # 内容が変わったら URL も変わるようにし、スマホ側には長期間キャッシュさせる
 CLIENT_SRC = f"/static/client.js?v={hashlib.sha256(_CLIENT_JS).hexdigest()[:10]}"
+
+_ICON_192 = (Path(__file__).parent / "static" / "icon-192.png").read_bytes()
+_ICON_512 = (Path(__file__).parent / "static" / "icon-512.png").read_bytes()
+ICON_192_SRC = f"/static/icon-192.png?v={hashlib.sha256(_ICON_192).hexdigest()[:10]}"
+ICON_512_SRC = f"/static/icon-512.png?v={hashlib.sha256(_ICON_512).hexdigest()[:10]}"
+
+_MANIFEST = json.dumps(
+    {
+        "name": "liteproxy",
+        "short_name": "liteproxy",
+        "start_url": "/",
+        "display": "standalone",
+        "background_color": "#1f2328",
+        "theme_color": "#1f2328",
+        "icons": [
+            {"src": ICON_192_SRC, "sizes": "192x192", "type": "image/png", "purpose": "any"},
+            {"src": ICON_512_SRC, "sizes": "512x512", "type": "image/png", "purpose": "any"},
+        ],
+    },
+    ensure_ascii=False,
+).encode("utf-8")
+
+# ホーム画面（外枠）だけをキャッシュする。/p・/v・/a・/i・/s・/f などの中継結果は
+# 古い内容をオフライン時に誤って返さないよう、対象に含めない。
+_SW_ASSETS = ["/", CLIENT_SRC, "/manifest.json", ICON_192_SRC, ICON_512_SRC]
+# 中身が変わったら Service Worker のテキスト自体も変わるようにし、ブラウザに再インストールさせる
+_SW_CACHE = "lp-" + hashlib.sha256("".join(_SW_ASSETS).encode()).hexdigest()[:10]
+_SERVICE_WORKER = f"""\
+const CACHE = {json.dumps(_SW_CACHE)};
+const ASSETS = {json.dumps(_SW_ASSETS)};
+const ASSET_URLS = new Set(ASSETS.map((p) => new URL(p, self.location.origin).href));
+
+self.addEventListener("install", (event) => {{
+  event.waitUntil(caches.open(CACHE).then((c) => c.addAll(ASSETS)).then(() => self.skipWaiting()));
+}});
+
+self.addEventListener("activate", (event) => {{
+  event.waitUntil(
+    caches.keys()
+      .then((keys) => Promise.all(keys.filter((k) => k !== CACHE && k.startsWith("lp-")).map((k) => caches.delete(k))))
+      .then(() => self.clients.claim())
+  );
+}});
+
+self.addEventListener("fetch", (event) => {{
+  const req = event.request;
+  if (req.method !== "GET" || !ASSET_URLS.has(req.url)) return;
+  event.respondWith(
+    fetch(req)
+      .then((res) => {{
+        if (res.ok) {{
+          const copy = res.clone();
+          caches.open(CACHE).then((c) => c.put(req, copy));
+        }}
+        return res;
+      }})
+      .catch(() => caches.match(req))
+  );
+}});
+""".encode("utf-8")
 
 
 # 表示モード（layout: レイアウトを保つ / reader: 本文だけ）
@@ -81,10 +144,15 @@ def viewport_from_cookie(value: str | None, cfg: BrowserConfig) -> Viewport:
         return default
 
 
-def page_headers(*, nonce: str, cache_control: str = "no-store", language: str | None = "ja") -> dict[str, str]:
-    """language は liteproxy 自身のページの言語。中継したページでは元の言語に任せるため None にする。"""
+def page_headers(
+    *, nonce: str, cache_control: str = "no-store", language: str | None = "ja", csp: str | None = None
+) -> dict[str, str]:
+    """language は liteproxy 自身のページの言語。中継したページでは元の言語に任せるため None にする。
+
+    csp を渡すと既定の _CSP の代わりに使う（home() だけ manifest-src/worker-src を足すため）。
+    """
     headers = {
-        "Content-Security-Policy": _CSP.format(nonce=nonce),
+        "Content-Security-Policy": csp if csp is not None else _CSP.format(nonce=nonce),
         "Referrer-Policy": "no-referrer",
         "X-Content-Type-Options": "nosniff",
         "X-Robots-Tag": "noindex, nofollow",
@@ -96,11 +164,17 @@ def page_headers(*, nonce: str, cache_control: str = "no-store", language: str |
 
 
 def html_response(
-    body: str, *, nonce: str, status: int = 200, max_age: int = 0, language: str | None = "ja"
+    body: str,
+    *,
+    nonce: str,
+    status: int = 200,
+    max_age: int = 0,
+    language: str | None = "ja",
+    csp: str | None = None,
 ) -> HTMLResponse:
     # 戻る操作で再取得しないよう、スマホのブラウザに短時間キャッシュさせる
     cache_control = f"private, max-age={max_age}" if max_age else "no-store"
-    headers = page_headers(nonce=nonce, cache_control=cache_control, language=language)
+    headers = page_headers(nonce=nonce, cache_control=cache_control, language=language, csp=csp)
     return HTMLResponse(body, status_code=status, headers=headers)
 
 
@@ -207,7 +281,11 @@ def create_app(
     @app.get("/")
     async def home() -> HTMLResponse:
         nonce = secrets.token_urlsafe(12)
-        return html_response(templates.home(nonce), nonce=nonce)
+        return html_response(
+            templates.home(nonce, icon_src=ICON_192_SRC),
+            nonce=nonce,
+            csp=_HOME_CSP.format(nonce=nonce),
+        )
 
     @app.get("/static/client.js")
     async def client_js() -> Response:
@@ -215,6 +293,39 @@ def create_app(
             _CLIENT_JS,
             media_type="text/javascript; charset=utf-8",
             headers={"Cache-Control": "private, max-age=31536000, immutable", "X-Content-Type-Options": "nosniff"},
+        )
+
+    @app.get("/static/icon-192.png")
+    async def icon_192() -> Response:
+        return Response(
+            _ICON_192,
+            media_type="image/png",
+            headers={"Cache-Control": "private, max-age=31536000, immutable", "X-Content-Type-Options": "nosniff"},
+        )
+
+    @app.get("/static/icon-512.png")
+    async def icon_512() -> Response:
+        return Response(
+            _ICON_512,
+            media_type="image/png",
+            headers={"Cache-Control": "private, max-age=31536000, immutable", "X-Content-Type-Options": "nosniff"},
+        )
+
+    @app.get("/manifest.json")
+    async def manifest() -> Response:
+        return Response(
+            _MANIFEST,
+            media_type="application/manifest+json",
+            headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+        )
+
+    @app.get("/service-worker.js")
+    async def service_worker() -> Response:
+        return Response(
+            _SERVICE_WORKER,
+            media_type="text/javascript; charset=utf-8",
+            # immutable にしない: ブラウザがバイト単位で内容を比較して更新を検知する仕組みを阻害しないため
+            headers={"Cache-Control": "no-cache", "X-Content-Type-Options": "nosniff"},
         )
 
     @app.get("/i")

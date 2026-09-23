@@ -41,12 +41,12 @@ def env_script(nonce: str, *, own: bool = False) -> str:
     return f'<script nonce="{nonce}"{" data-lp-x" if own else ""}>{_ENV_SCRIPT}</script>'
 
 
-def _page(title: str, body: str, nonce: str) -> str:
+def _page(title: str, body: str, nonce: str, *, head_extra: str = "", body_extra: str = "") -> str:
     return (
         '<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
-        f"<title>{escape(title)}</title><style>{_BASE_CSS}</style></head>"
-        f"<body>{body}{env_script(nonce)}</body></html>"
+        f"<title>{escape(title)}</title><style>{_BASE_CSS}</style>{head_extra}</head>"
+        f"<body>{body}{env_script(nonce)}{body_extra}</body></html>"
     )
 
 
@@ -58,8 +58,22 @@ def _address_form(value: str = "") -> str:
     )
 
 
-def home(nonce: str) -> str:
-    return _page("liteproxy", "<h1>liteproxy</h1>" + _address_form(), nonce)
+def home(nonce: str, *, icon_src: str) -> str:
+    head_extra = (
+        '<link rel="manifest" href="/manifest.json" crossorigin="use-credentials">'
+        '<meta name="theme-color" content="#1f2328">'
+        f'<link rel="icon" href="{escape(icon_src)}" type="image/png">'
+        f'<link rel="apple-touch-icon" href="{escape(icon_src)}">'
+        '<meta name="apple-mobile-web-app-capable" content="yes">'
+        '<meta name="apple-mobile-web-app-title" content="liteproxy">'
+    )
+    body_extra = (
+        f'<script nonce="{nonce}">if("serviceWorker" in navigator)'
+        'navigator.serviceWorker.register("/service-worker.js")</script>'
+    )
+    return _page(
+        "liteproxy", "<h1>liteproxy</h1>" + _address_form(), nonce, head_extra=head_extra, body_extra=body_extra
+    )
 
 
 def error_page(message: str, nonce: str, *, target: str | None = None) -> str:

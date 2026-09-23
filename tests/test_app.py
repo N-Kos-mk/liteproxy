@@ -4,7 +4,7 @@ import io
 import json
 import re
 import threading
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import jwt
 import pytest
@@ -13,7 +13,7 @@ from PIL import Image
 
 from liteproxy.browser import ActResult, NonHtml, RenderError, Snapshot, Viewport
 from liteproxy.config import Config
-from liteproxy.main import CLIENT_SRC, create_app, viewport_from_cookie
+from liteproxy.main import CLIENT_SRC, ICON_192_SRC, ICON_512_SRC, create_app, viewport_from_cookie
 
 SNAPSHOT = Snapshot(
     url="https://8.8.8.8/final",
@@ -82,6 +82,24 @@ def test_home_has_address_form_and_csp():
     assert "default-src 'none'" in res.headers["content-security-policy"]
     assert res.headers["content-language"] == "ja"
     assert '<html lang="ja">' in res.text
+
+
+def test_home_includes_pwa_tags():
+    with make_client() as client:
+        res = client.get("/")
+    assert 'rel="manifest" href="/manifest.json" crossorigin="use-credentials"' in res.text
+    assert 'name="theme-color" content="#1f2328"' in res.text
+    assert 'navigator.serviceWorker.register("/service-worker.js")' in res.text
+    csp = res.headers["content-security-policy"]
+    assert "manifest-src 'self'" in csp and "worker-src 'self'" in csp
+
+
+def test_other_pages_csp_excludes_manifest_and_worker():
+    with make_client() as client:
+        loader, view = open_page(client, "https://8.8.8.8/")
+    for res in (loader, view):
+        csp = res.headers["content-security-policy"]
+        assert "manifest-src" not in csp and "worker-src" not in csp
 
 
 def test_non_url_input_goes_to_search():
@@ -391,3 +409,41 @@ def test_access_middleware(headers, status):
 )
 def test_viewport_from_cookie(value, expected):
     assert viewport_from_cookie(value, Config().browser) == expected
+
+
+def test_manifest_json():
+    with make_client() as client:
+        res = client.get("/manifest.json")
+    body = res.json()
+    assert body["name"] == "liteproxy" and body["display"] == "standalone"
+    assert [icon["sizes"] for icon in body["icons"]] == ["192x192", "512x512"]
+    assert res.headers["content-type"].startswith("application/manifest+json")
+    assert res.headers["cache-control"] == "no-store"
+
+
+def test_service_worker_never_caches_dynamic_routes():
+    with make_client() as client:
+        res = client.get("/service-worker.js")
+    m = re.search(r"const ASSETS = (\[.*?\]);", res.text)
+    assert m, "Service Worker に ASSETS の定義が見つからない"
+    assets = json.loads(m.group(1))
+    assert CLIENT_SRC in assets
+    dynamic_paths = {"/p", "/v", "/a", "/i", "/s", "/f"}
+    assert not any(urlsplit(a).path in dynamic_paths for a in assets)
+    assert res.headers["content-type"].startswith("text/javascript")
+    assert res.headers["cache-control"] == "no-cache"
+
+
+def test_icon_routes_serve_expected_sizes():
+    with make_client() as client:
+        for src, size in ((ICON_192_SRC, 192), (ICON_512_SRC, 512)):
+            res = client.get(src)
+            assert Image.open(io.BytesIO(res.content)).size == (size, size)
+            assert res.headers["content-type"] == "image/png"
+            assert "immutable" in res.headers["cache-control"]
+
+
+@pytest.mark.parametrize("path", ["/manifest.json", "/service-worker.js", ICON_192_SRC, ICON_512_SRC])
+def test_access_middleware_also_protects_pwa_routes(path):
+    with make_client(verifier=_Verifier()) as client:
+        assert client.get(path).status_code == 403

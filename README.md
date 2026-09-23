@@ -199,6 +199,7 @@ Start-ScheduledTask -TaskName liteproxy
   - `本文` / `全体`：表示モードを切り替える
   - `元`：元のページを直接開く（通信量に注意）
 - **画面の条件**：スマートフォンの画面幅、DPR、ダークモードの設定は、liteproxyのページを開いたときにCookie（`lp_env`）へ保存されます。次のページからは、PC側も同じ条件で描画します。
+- **ホーム画面に追加**：ホーム画面（`/`）をブラウザの「ホーム画面に追加」から追加すると、アプリのように開けます。中継先のページ（`/p`・`/v`など）はこれまでどおりブラウザ内で表示され、キャッシュの対象にはなりません。
 
 ## 設定
 
@@ -252,7 +253,8 @@ Start-ScheduledTask -TaskName liteproxy
 | 4 | 動画（低ビットレートへの変換、音声のみなど） | 予定 |
 | 5 | readerモード（本文だけの表示） | 完了 |
 | 6 | 無限スクロール、入力中に候補を出す検索欄への対応 | 予定 |
-| — | Webアプリ（PWA）化 | 検討中 |
+| — | Webアプリ（PWA）化 第一段階（manifest・アイコン・Service Workerでホーム画面に追加） | 完了 |
+| — | Webアプリ（PWA）化 第二段階（外枠 + iframe化、Web Share Target） | 検討中 |
 
 ## 開発
 
@@ -266,7 +268,7 @@ uv run pytest
 ```
 liteproxy/
 ├─ __main__.py            起動処理（python -m liteproxy）
-├─ main.py                FastAPI アプリ（ルーティング・CSP・Access の検証・読み込み中画面の配信・操作の中継）
+├─ main.py                FastAPI アプリ（ルーティング・CSP・Access の検証・読み込み中画面の配信・操作の中継・PWA の manifest/Service Worker 配信）
 ├─ jobs.py                描画ジョブの管理（進捗の通知、結果の短期保持）
 ├─ config.py              設定ファイルの読み込み
 ├─ security.py            SSRF 対策、Access の JWT 検証
@@ -276,7 +278,8 @@ liteproxy/
 ├─ media/
 │  └─ image.py            画像の縮小・再圧縮と、元画像・変換結果の保持
 ├─ static/
-│  └─ client.js           スマホ側で動く唯一の JS（画像のタップ読み込み、操作の中継と差分の反映）
+│  ├─ client.js           スマホ側で動く唯一の JS（画像のタップ読み込み、操作の中継と差分の反映）
+│  └─ icon-*.png          PWA のアイコン（manifest.json から参照）
 ├─ browser/
 │  ├─ pool.py             Playwright による描画と、保持したページでの操作の再現
 │  └─ inject/transform.js PC 側の Chrome で実行する変換処理（ミラーの管理と差分の生成を含む）
