@@ -499,6 +499,18 @@ def test_app_shell_has_address_bar_back_forward_and_iframe():
     assert 'action="/p" target="lp-view"' in res.text
     assert 'id="lp-back"' in res.text and 'id="lp-fwd"' in res.text
     assert 'src="/"' in res.text
+    assert 'id="lp-img-btn"' in res.text and 'id="lp-mode-btn"' in res.text and 'id="lp-orig-btn"' in res.text
+    assert "getElementById('lp-img')" in res.text
+    assert "getElementById('lp-mode')" in res.text
+    assert "getElementById('lp-orig')" in res.text
+
+
+def test_toolbar_exposes_ids_for_shell_to_operate():
+    with make_client() as client:
+        _, view = open_page(client, "https://8.8.8.8/", headers=IFRAME_HEADERS)
+    assert 'id="lp-mode"' in view.text
+    assert 'id="lp-orig"' in view.text
+    assert 'id="lp-img"' in view.text
 
 
 def test_app_shell_includes_pwa_tags_and_csp():
