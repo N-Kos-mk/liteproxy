@@ -30,6 +30,7 @@ class Renderer(Protocol):
         user_agent: str | None,
         on_stage: StageCallback | None = None,
         image_quality: str | None = None,
+        mode: str = "layout",
     ) -> Snapshot | NonHtml: ...
     async def act(
         self, session_id: str, rev: int, path: list[int], image_quality: str | None = None
@@ -44,6 +45,7 @@ class RenderKey:
     viewport: Viewport
     user_agent: str
     image_quality: str | None = None  # 画像の枠に表示するサイズの画質（None なら表示しない）
+    mode: str = "layout"  # 表示モード（layout: レイアウトを保つ / reader: 本文だけ）
 
 
 class Job:
@@ -159,7 +161,12 @@ class RenderJobs:
         key = job.key
         try:
             result = await self._renderer.render(
-                key.url, key.viewport, key.user_agent, on_stage=job.set_stage, image_quality=key.image_quality
+                key.url,
+                key.viewport,
+                key.user_agent,
+                on_stage=job.set_stage,
+                image_quality=key.image_quality,
+                mode=key.mode,
             )
         except RenderError as e:
             job.fail(str(e))

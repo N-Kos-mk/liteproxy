@@ -4,7 +4,7 @@ import io
 import json
 import re
 import threading
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import jwt
 import pytest
@@ -13,7 +13,7 @@ from PIL import Image
 
 from liteproxy.browser import ActResult, NonHtml, RenderError, Snapshot, Viewport
 from liteproxy.config import Config
-from liteproxy.main import CLIENT_SRC, create_app, viewport_from_cookie
+from liteproxy.main import CLIENT_SRC, ICON_192_SRC, ICON_512_SRC, create_app, viewport_from_cookie
 
 SNAPSHOT = Snapshot(
     url="https://8.8.8.8/final",
@@ -46,9 +46,10 @@ class FakeRenderer:
     async def stop(self):
         pass
 
-    async def render(self, url, viewport, user_agent, on_stage=None, image_quality=None):
+    async def render(self, url, viewport, user_agent, on_stage=None, image_quality=None, mode="layout"):
         self.calls.append((url, viewport, user_agent))
         self.image_quality = image_quality
+        self.mode = mode
         for stage in ("fetching", "running", "transforming"):
             if on_stage:
                 on_stage(stage)
@@ -81,6 +82,64 @@ def test_home_has_address_form_and_csp():
     assert "default-src 'none'" in res.headers["content-security-policy"]
     assert res.headers["content-language"] == "ja"
     assert '<html lang="ja">' in res.text
+
+
+def test_home_includes_pwa_tags():
+    with make_client() as client:
+        res = client.get("/")
+    assert 'rel="manifest" href="/manifest.json" crossorigin="use-credentials"' in res.text
+    assert 'name="theme-color" content="#1f2328"' in res.text
+    assert 'navigator.serviceWorker.register("/service-worker.js")' in res.text
+    csp = res.headers["content-security-policy"]
+    assert "manifest-src 'self'" in csp and "worker-src 'self'" in csp
+
+
+def test_other_pages_csp_excludes_manifest_and_worker():
+    with make_client() as client:
+        loader, view = open_page(client, "https://8.8.8.8/")
+    for res in (loader, view):
+        csp = res.headers["content-security-policy"]
+        assert "manifest-src" not in csp and "worker-src" not in csp
+
+
+IFRAME_HEADERS = {"Sec-Fetch-Dest": "iframe", "Sec-Fetch-Site": "same-origin"}
+
+
+def test_iframe_request_hides_toolbar_and_relaxes_frame_ancestors():
+    with make_client() as client:
+        loader, view = open_page(client, "https://8.8.8.8/", headers=IFRAME_HEADERS)
+    for res in (loader, view):
+        assert "frame-ancestors 'self'" in res.headers["content-security-policy"]
+    assert "<lp-bar hidden " in view.text
+
+
+def test_non_iframe_request_keeps_toolbar_and_strict_csp():
+    with make_client() as client:
+        loader, view = open_page(client, "https://8.8.8.8/")
+    for res in (loader, view):
+        assert "frame-ancestors 'none'" in res.headers["content-security-policy"]
+    assert "<lp-bar hidden" not in view.text
+
+
+def test_cross_site_iframe_hint_is_ignored():
+    headers = {"Sec-Fetch-Dest": "iframe", "Sec-Fetch-Site": "cross-site"}
+    with make_client() as client:
+        _, view = open_page(client, "https://8.8.8.8/", headers=headers)
+    assert "frame-ancestors 'none'" in view.headers["content-security-policy"]
+    assert "<lp-bar hidden" not in view.text
+
+
+def test_blocked_host_error_page_respects_embed_header():
+    with make_client() as client:
+        res = client.get("/p", params={"u": "http://192.168.1.1/"}, headers=IFRAME_HEADERS)
+    assert res.status_code == 403
+    assert "frame-ancestors 'self'" in res.headers["content-security-policy"]
+
+
+def test_cacheable_relay_page_varies_by_fetch_metadata():
+    with make_client() as client:
+        _, view = open_page(client, "https://8.8.8.8/")
+    assert "Sec-Fetch-Dest" in view.headers.get("vary", "")
 
 
 def test_non_url_input_goes_to_search():
@@ -303,6 +362,28 @@ def test_csp_allows_only_same_origin_requests():
     assert "connect-src 'self'" in csp
 
 
+def test_reader_mode_is_requested_and_remembered():
+    renderer = FakeRenderer()
+    with make_client(renderer) as client:
+        res = client.get("/p", params={"u": "https://8.8.8.8/", "m": "reader"})
+        assert renderer.mode == "reader"
+        assert res.cookies.get("lp_m") == "reader"
+        # 次のページは Cookie でモードが決まる
+        client.get("/p", params={"u": "https://8.8.8.8/next"})
+        assert renderer.mode == "reader"
+        # 不正な値は無視して Cookie の値を使う
+        client.get("/p", params={"u": "https://8.8.8.8/other", "m": "bogus"})
+        assert renderer.mode == "reader"
+
+
+@pytest.mark.parametrize(("mode", "label", "switch"), [("layout", "本文", "reader"), ("reader", "全体", "layout")])
+def test_toolbar_switches_modes(mode, label, switch):
+    snap = Snapshot(**{**SNAPSHOT.__dict__, "mode": mode})
+    with make_client(FakeRenderer(snap)) as client:
+        _, res = open_page(client, "https://8.8.8.8/")
+    assert f'&m={switch}" title=' in res.text and f">{label}</a>" in res.text
+
+
 def test_get_form_is_forwarded():
     with make_client() as client:
         res = client.get(
@@ -368,3 +449,86 @@ def test_access_middleware(headers, status):
 )
 def test_viewport_from_cookie(value, expected):
     assert viewport_from_cookie(value, Config().browser) == expected
+
+
+def test_manifest_json():
+    with make_client() as client:
+        res = client.get("/manifest.json")
+    body = res.json()
+    assert body["name"] == "liteproxy" and body["display"] == "standalone"
+    assert body["start_url"] == "/app"
+    assert [icon["sizes"] for icon in body["icons"]] == ["192x192", "512x512"]
+    assert res.headers["content-type"].startswith("application/manifest+json")
+    assert res.headers["cache-control"] == "no-store"
+
+
+def test_service_worker_never_caches_dynamic_routes():
+    with make_client() as client:
+        res = client.get("/service-worker.js")
+    m = re.search(r"const ASSETS = (\[.*?\]);", res.text)
+    assert m, "Service Worker に ASSETS の定義が見つからない"
+    assets = json.loads(m.group(1))
+    assert CLIENT_SRC in assets
+    assert "/app" in assets
+    dynamic_paths = {"/p", "/v", "/a", "/i", "/s", "/f"}
+    assert not any(urlsplit(a).path in dynamic_paths for a in assets)
+    assert res.headers["content-type"].startswith("text/javascript")
+    assert res.headers["cache-control"] == "no-cache"
+
+
+def test_icon_routes_serve_expected_sizes():
+    with make_client() as client:
+        for src, size in ((ICON_192_SRC, 192), (ICON_512_SRC, 512)):
+            res = client.get(src)
+            assert Image.open(io.BytesIO(res.content)).size == (size, size)
+            assert res.headers["content-type"] == "image/png"
+            assert "immutable" in res.headers["cache-control"]
+
+
+@pytest.mark.parametrize("path", ["/app", "/manifest.json", "/service-worker.js", ICON_192_SRC, ICON_512_SRC])
+def test_access_middleware_also_protects_pwa_routes(path):
+    with make_client(verifier=_Verifier()) as client:
+        assert client.get(path).status_code == 403
+
+
+def test_app_shell_has_address_bar_back_forward_and_iframe():
+    with make_client() as client:
+        res = client.get("/app")
+    assert res.status_code == 200
+    assert 'id="lp-view"' in res.text and 'name="lp-view"' in res.text
+    assert 'action="/p" target="lp-view"' in res.text
+    assert 'id="lp-back"' in res.text and 'id="lp-fwd"' in res.text
+    assert 'src="/"' in res.text
+    assert 'id="lp-img-btn"' in res.text and 'id="lp-mode-btn"' in res.text and 'id="lp-orig-btn"' in res.text
+    assert "getElementById('lp-img')" in res.text
+    assert "getElementById('lp-mode')" in res.text
+    assert "getElementById('lp-orig')" in res.text
+
+
+def test_toolbar_exposes_ids_for_shell_to_operate():
+    with make_client() as client:
+        _, view = open_page(client, "https://8.8.8.8/", headers=IFRAME_HEADERS)
+    assert 'id="lp-mode"' in view.text
+    assert 'id="lp-orig"' in view.text
+    assert 'id="lp-img"' in view.text
+
+
+def test_app_shell_includes_pwa_tags_and_csp():
+    with make_client() as client:
+        res = client.get("/app")
+    assert 'rel="manifest" href="/manifest.json" crossorigin="use-credentials"' in res.text
+    assert 'navigator.serviceWorker.register("/service-worker.js")' in res.text
+    csp = res.headers["content-security-policy"]
+    assert "manifest-src 'self'" in csp and "worker-src 'self'" in csp
+    assert "frame-ancestors 'none'" in csp
+    assert "frame-src 'self'" in csp
+
+
+def test_home_relaxes_frame_ancestors_only_when_embedded():
+    with make_client() as client:
+        direct = client.get("/")
+        embedded = client.get("/", headers=IFRAME_HEADERS)
+    assert "frame-ancestors 'none'" in direct.headers["content-security-policy"]
+    assert "frame-ancestors 'self'" in embedded.headers["content-security-policy"]
+    for res in (direct, embedded):
+        assert "manifest-src 'self'" in res.headers["content-security-policy"]

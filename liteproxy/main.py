@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import secrets
 from collections.abc import AsyncIterator
@@ -51,11 +52,82 @@ _CSP = (
 )
 # /i は取得した画像をそのまま返すことがあるため、SVG 内のスクリプトなどが動かないようにする
 _IMAGE_CSP = "default-src 'none'; style-src 'unsafe-inline'; sandbox"
+# ホームと /app（シェル）だけ、PWA の manifest と Service Worker の登録を許可する
+# （default-src 'none' はどちらにもフォールバックしないため明示が必要）
+_PWA_CSP = _CSP + "; manifest-src 'self'; worker-src 'self'"
+# 中継ページを iframe に埋め込めるよう、埋め込みが確認できたときだけ frame-ancestors を緩める。
+# frame-src 'self' は既存の _CSP に既にある（元ページ内の iframe を残す機能のため）ので変更不要
+_CSP_EMBEDDABLE = _CSP.replace("frame-ancestors 'none'", "frame-ancestors 'self'")
+# ホーム（/）は /app のシェルが最初に iframe へ読み込む先でもあるため、埋め込み時だけ frame-ancestors を緩める
+_PWA_CSP_EMBEDDABLE = _CSP_EMBEDDABLE + "; manifest-src 'self'; worker-src 'self'"
 
 _CLIENT_JS = (Path(__file__).parent / "static" / "client.js").read_bytes()
 # 内容が変わったら URL も変わるようにし、スマホ側には長期間キャッシュさせる
 CLIENT_SRC = f"/static/client.js?v={hashlib.sha256(_CLIENT_JS).hexdigest()[:10]}"
 
+_ICON_192 = (Path(__file__).parent / "static" / "icon-192.png").read_bytes()
+_ICON_512 = (Path(__file__).parent / "static" / "icon-512.png").read_bytes()
+ICON_192_SRC = f"/static/icon-192.png?v={hashlib.sha256(_ICON_192).hexdigest()[:10]}"
+ICON_512_SRC = f"/static/icon-512.png?v={hashlib.sha256(_ICON_512).hexdigest()[:10]}"
+
+_MANIFEST = json.dumps(
+    {
+        "name": "liteproxy",
+        "short_name": "liteproxy",
+        "start_url": "/app",
+        "display": "standalone",
+        "background_color": "#1f2328",
+        "theme_color": "#1f2328",
+        "icons": [
+            {"src": ICON_192_SRC, "sizes": "192x192", "type": "image/png", "purpose": "any"},
+            {"src": ICON_512_SRC, "sizes": "512x512", "type": "image/png", "purpose": "any"},
+        ],
+    },
+    ensure_ascii=False,
+).encode("utf-8")
+
+# ホーム画面（外枠）だけをキャッシュする。/p・/v・/a・/i・/s・/f などの中継結果は
+# 古い内容をオフライン時に誤って返さないよう、対象に含めない。
+_SW_ASSETS = ["/", "/app", CLIENT_SRC, "/manifest.json", ICON_192_SRC, ICON_512_SRC]
+# 中身が変わったら Service Worker のテキスト自体も変わるようにし、ブラウザに再インストールさせる
+_SW_CACHE = "lp-" + hashlib.sha256("".join(_SW_ASSETS).encode()).hexdigest()[:10]
+_SERVICE_WORKER = f"""\
+const CACHE = {json.dumps(_SW_CACHE)};
+const ASSETS = {json.dumps(_SW_ASSETS)};
+const ASSET_URLS = new Set(ASSETS.map((p) => new URL(p, self.location.origin).href));
+
+self.addEventListener("install", (event) => {{
+  event.waitUntil(caches.open(CACHE).then((c) => c.addAll(ASSETS)).then(() => self.skipWaiting()));
+}});
+
+self.addEventListener("activate", (event) => {{
+  event.waitUntil(
+    caches.keys()
+      .then((keys) => Promise.all(keys.filter((k) => k !== CACHE && k.startsWith("lp-")).map((k) => caches.delete(k))))
+      .then(() => self.clients.claim())
+  );
+}});
+
+self.addEventListener("fetch", (event) => {{
+  const req = event.request;
+  if (req.method !== "GET" || !ASSET_URLS.has(req.url)) return;
+  event.respondWith(
+    fetch(req)
+      .then((res) => {{
+        if (res.ok) {{
+          const copy = res.clone();
+          caches.open(CACHE).then((c) => c.put(req, copy));
+        }}
+        return res;
+      }})
+      .catch(() => caches.match(req))
+  );
+}});
+""".encode("utf-8")
+
+
+# 表示モード（layout: レイアウトを保つ / reader: 本文だけ）
+MODES = ("layout", "reader")
 
 # 読み込み中画面へ、段階に変化がなくてもこの間隔で生存通知を送る
 LOADER_HEARTBEAT_SEC = 2.0
@@ -78,10 +150,34 @@ def viewport_from_cookie(value: str | None, cfg: BrowserConfig) -> Viewport:
         return default
 
 
-def page_headers(*, nonce: str, cache_control: str = "no-store", language: str | None = "ja") -> dict[str, str]:
-    """language は liteproxy 自身のページの言語。中継したページでは元の言語に任せるため None にする。"""
+def is_embedded(request: Request) -> bool:
+    """/app のシェルが iframe として埋め込んでいるかを、ブラウザが自動付与する（JS からは偽装できない）
+    Fetch Metadata ヘッダーで判定する。無ければ安全側（今までどおりツールバー表示・埋め込み不可）に倒す。"""
+    return (
+        request.headers.get("sec-fetch-dest") == "iframe"
+        and request.headers.get("sec-fetch-site") in ("same-origin", "none")
+    )
+
+
+def page_headers(
+    *,
+    nonce: str,
+    cache_control: str = "no-store",
+    language: str | None = "ja",
+    csp: str | None = None,
+    embed: bool = False,
+) -> dict[str, str]:
+    """language は liteproxy 自身のページの言語。中継したページでは元の言語に任せるため None にする。
+
+    csp を渡すと既定の代わりに使う（home()/app() だけ manifest-src/worker-src を足すため）。
+    embed は csp を渡さないときだけ効き、iframe に埋め込まれたときだけ frame-ancestors を緩める。
+    """
+    if csp is not None:
+        resolved_csp = csp
+    else:
+        resolved_csp = (_CSP_EMBEDDABLE if embed else _CSP).format(nonce=nonce)
     headers = {
-        "Content-Security-Policy": _CSP.format(nonce=nonce),
+        "Content-Security-Policy": resolved_csp,
         "Referrer-Policy": "no-referrer",
         "X-Content-Type-Options": "nosniff",
         "X-Robots-Tag": "noindex, nofollow",
@@ -89,15 +185,26 @@ def page_headers(*, nonce: str, cache_control: str = "no-store", language: str |
     }
     if language:
         headers["Content-Language"] = language
+    # embed の有無でレスポンス内容（frame-ancestors・ツールバーの表示）が変わるため、
+    # スマホ側の HTTP キャッシュが埋め込み/非埋め込みの応答を取り違えないようにする
+    if cache_control.startswith("private, max-age"):
+        headers["Vary"] = "Sec-Fetch-Dest, Sec-Fetch-Site"
     return headers
 
 
 def html_response(
-    body: str, *, nonce: str, status: int = 200, max_age: int = 0, language: str | None = "ja"
+    body: str,
+    *,
+    nonce: str,
+    status: int = 200,
+    max_age: int = 0,
+    language: str | None = "ja",
+    csp: str | None = None,
+    embed: bool = False,
 ) -> HTMLResponse:
     # 戻る操作で再取得しないよう、スマホのブラウザに短時間キャッシュさせる
     cache_control = f"private, max-age={max_age}" if max_age else "no-store"
-    headers = page_headers(nonce=nonce, cache_control=cache_control, language=language)
+    headers = page_headers(nonce=nonce, cache_control=cache_control, language=language, csp=csp, embed=embed)
     return HTMLResponse(body, status_code=status, headers=headers)
 
 
@@ -145,24 +252,35 @@ def create_app(
 
     jobs = RenderJobs(pool, on_complete=on_complete)
 
+    def page_mode(request: Request, requested: str = "") -> str:
+        """表示モードは、URL の m、Cookie（lp_m）、設定の既定値の順に決める。"""
+        if requested in MODES:
+            return requested
+        cookie = request.cookies.get("lp_m", "")
+        return cookie if cookie in MODES else config.render.default_mode
+
     def image_quality(request: Request) -> str:
         q = request.cookies.get("lp_q", "")
         return q if q in QUALITY_LABELS else default_quality
 
-    def render_key(request: Request, target: str) -> RenderKey:
+    def render_key(request: Request, target: str, mode: str | None = None) -> RenderKey:
         viewport = viewport_from_cookie(request.cookies.get("lp_env"), config.browser)
         # 画像の枠に表示するサイズは画質ごとに異なるため、画質も描画条件に含める
         quality = image_quality(request) if config.image.precompute else None
-        return RenderKey(target, viewport, request.headers.get("user-agent", ""), quality)
+        return RenderKey(
+            target, viewport, request.headers.get("user-agent", ""), quality, mode or page_mode(request)
+        )
 
-    def result_response(result: Snapshot | NonHtml) -> Response:
+    def result_response(result: Snapshot | NonHtml, *, embed: bool = False) -> Response:
         nonce = secrets.token_urlsafe(12)
         if isinstance(result, NonHtml):
             size = human(result.size) if result.size is not None else "不明"
             page = templates.non_html_page(result.url, result.content_type, size, nonce)
-            return html_response(page, nonce=nonce)
-        html, _ = layout.finalize(result, nonce, default_quality=default_quality, client_src=CLIENT_SRC)
-        return html_response(html, nonce=nonce, max_age=300, language=None)
+            return html_response(page, nonce=nonce, embed=embed)
+        html, _ = layout.finalize(
+            result, nonce, default_quality=default_quality, client_src=CLIENT_SRC, embed=embed
+        )
+        return html_response(html, nonce=nonce, max_age=300, language=None, embed=embed)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -193,9 +311,25 @@ def create_app(
             return await call_next(request)
 
     @app.get("/")
-    async def home() -> HTMLResponse:
+    async def home(request: Request) -> HTMLResponse:
         nonce = secrets.token_urlsafe(12)
-        return html_response(templates.home(nonce), nonce=nonce)
+        # /app のシェルが最初に読み込む iframe の src でもあるため、埋め込み時は frame-ancestors を緩める
+        csp = _PWA_CSP_EMBEDDABLE if is_embedded(request) else _PWA_CSP
+        return html_response(
+            templates.home(nonce, icon_src=ICON_192_SRC),
+            nonce=nonce,
+            csp=csp.format(nonce=nonce),
+        )
+
+    @app.get("/app")
+    async def app_shell() -> HTMLResponse:
+        """外枠（アドレス欄・戻る/進む）。中身は iframe で /p・/v を表示する。"""
+        nonce = secrets.token_urlsafe(12)
+        return html_response(
+            templates.shell(nonce, icon_src=ICON_192_SRC),
+            nonce=nonce,
+            csp=_PWA_CSP.format(nonce=nonce),
+        )
 
     @app.get("/static/client.js")
     async def client_js() -> Response:
@@ -203,6 +337,39 @@ def create_app(
             _CLIENT_JS,
             media_type="text/javascript; charset=utf-8",
             headers={"Cache-Control": "private, max-age=31536000, immutable", "X-Content-Type-Options": "nosniff"},
+        )
+
+    @app.get("/static/icon-192.png")
+    async def icon_192() -> Response:
+        return Response(
+            _ICON_192,
+            media_type="image/png",
+            headers={"Cache-Control": "private, max-age=31536000, immutable", "X-Content-Type-Options": "nosniff"},
+        )
+
+    @app.get("/static/icon-512.png")
+    async def icon_512() -> Response:
+        return Response(
+            _ICON_512,
+            media_type="image/png",
+            headers={"Cache-Control": "private, max-age=31536000, immutable", "X-Content-Type-Options": "nosniff"},
+        )
+
+    @app.get("/manifest.json")
+    async def manifest() -> Response:
+        return Response(
+            _MANIFEST,
+            media_type="application/manifest+json",
+            headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+        )
+
+    @app.get("/service-worker.js")
+    async def service_worker() -> Response:
+        return Response(
+            _SERVICE_WORKER,
+            media_type="text/javascript; charset=utf-8",
+            # immutable にしない: ブラウザがバイト単位で内容を比較して更新を検知する仕組みを阻害しないため
+            headers={"Cache-Control": "no-cache", "X-Content-Type-Options": "nosniff"},
         )
 
     @app.get("/i")
@@ -244,9 +411,18 @@ def create_app(
         return RedirectResponse(proxy_url(target), status_code=303)
 
     @app.get("/p")
-    async def proxy(request: Request, u: str = "", f: str = "") -> Response:
-        """f=1 なら保持している結果を使わずに描画し直す（PC 側のページが失われた場合など）。"""
+    async def proxy(request: Request, u: str = "", f: str = "", m: str = "") -> Response:
+        """m で表示モードを指定できる（layout / reader）。指定すると次のページからも同じモードになる。
+
+        f=1 なら保持している結果を使わずに描画し直す（PC 側のページが失われた場合など）。
+        """
         nonce = secrets.token_urlsafe(12)
+        embed = is_embedded(request)
+
+        def keep_mode(response: Response) -> Response:
+            if m in MODES:
+                response.set_cookie("lp_m", m, max_age=31536000, path="/", samesite="lax")
+            return response
         target = normalize_input(u)
         if target is None:
             if u.strip():
@@ -255,20 +431,22 @@ def create_app(
         target = unwrap_redirector(target)
         if not await guard.allowed(target):
             message = "このURLは開けません（内部ネットワーク宛て、またはブロック対象のドメインです）。"
-            return html_response(templates.error_page(message, nonce), nonce=nonce, status=403)
+            return html_response(templates.error_page(message, nonce), nonce=nonce, status=403, embed=embed)
 
-        key = render_key(request, target)
+        key = render_key(request, target, page_mode(request, m))
         force = f == "1"
         cached = None if force else jobs.cached(key)
         if cached is not None:
-            return result_response(cached)
+            return keep_mode(result_response(cached, embed=embed))
         # 描画を待たずに読み込み中画面を返し、進捗を流し続ける。完了したら /v へ移動させる。
         # no-transform は Cloudflare に圧縮・加工させず、進捗をため込まずに届けるため
         job = jobs.start(key, force=force)
-        return StreamingResponse(
-            loader_stream(job, target, nonce),
-            media_type="text/html",
-            headers=page_headers(nonce=nonce, cache_control="no-store, no-transform"),
+        return keep_mode(
+            StreamingResponse(
+                loader_stream(job, target, nonce),
+                media_type="text/html",
+                headers=page_headers(nonce=nonce, cache_control="no-store, no-transform", embed=embed),
+            )
         )
 
     @app.get("/v")
@@ -283,7 +461,7 @@ def create_app(
             result = jobs.cached(render_key(request, target))
         if result is None:
             return RedirectResponse(proxy_url(target), status_code=303)
-        return result_response(result)
+        return result_response(result, embed=is_embedded(request))
 
     @app.post("/a")
     async def act(request: Request) -> Response:
@@ -351,7 +529,12 @@ def create_app(
                 fields.append((key, value))
         if normalize_input(action) is None:
             nonce = secrets.token_urlsafe(12)
-            return html_response(templates.error_page("フォームの送信先が不正です。", nonce), nonce=nonce, status=400)
+            return html_response(
+                templates.error_page("フォームの送信先が不正です。", nonce),
+                nonce=nonce,
+                status=400,
+                embed=is_embedded(request),
+            )
         return RedirectResponse(proxy_url(build_form_target(action, fields, charset)), status_code=303)
 
     @app.post("/f")
@@ -364,6 +547,8 @@ def create_app(
             action = (await request.form()).get(FORM_ACTION_FIELD, "")
         message = "PC側のページが保持されていないため、この送信はできません。ページを開き直してから送信してください。"
         target = normalize_input(action) if isinstance(action, str) else None
-        return html_response(templates.error_page(message, nonce, target=target), nonce=nonce, status=409)
+        return html_response(
+            templates.error_page(message, nonce, target=target), nonce=nonce, status=409, embed=is_embedded(request)
+        )
 
     return app

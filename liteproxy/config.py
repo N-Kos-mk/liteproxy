@@ -51,6 +51,8 @@ class RenderConfig:
     max_inline_svg: int = 3000  # これより大きいインライン SVG は中身を捨てて枠だけ残す
     max_data_uri: int = 2048  # これ以下の data: URI（小さなアイコン等）はそのまま残す
     prune_classes: bool = True  # CSS から参照されない class 名を削る
+    default_mode: str = "layout"  # 既定の表示モード（layout: レイアウトを保つ / reader: 本文だけ）
+    reader_min_chars: int = 300  # reader モードで本文とみなす最小の文字数。下回ると layout に切り替える
     # 描画結果から取り除く要素（主に Cookie 同意バナー。JS なしでは閉じられないため）
     remove_selectors: list[str] = field(
         default_factory=lambda: [
@@ -176,6 +178,8 @@ def load_config(path: Path | None) -> Config:
         raise ConfigError("[access] enabled = true の場合は team_domain と aud が必要です")
     if "{q}" not in config.search.url:
         raise ConfigError("[search] url には {q} を含めてください")
+    if config.render.default_mode not in ("layout", "reader"):
+        raise ConfigError("[render] default_mode は layout か reader にしてください")
     if config.image.default_quality not in ("low", "mid", "high", "orig"):
         raise ConfigError("[image] default_quality は low / mid / high / orig のいずれかにしてください")
     return config
