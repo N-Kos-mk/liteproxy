@@ -40,7 +40,10 @@ def run(site: str, scenario, *, page: str = "/page.html", sessions: SessionConfi
         )
         try:
             await pool.start()
+            # start() は起動に失敗してもアプリを落とさないため、ここで明示的に確かめる
+            await pool.ensure_ready()
         except Exception as e:  # noqa: BLE001
+            await pool.stop()
             pytest.skip(f"ブラウザを起動できません: {e}")
         try:
             snap = await pool.render(site + page, Viewport(390, 844, 2, False), None)

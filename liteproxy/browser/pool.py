@@ -345,8 +345,22 @@ class BrowserPool:
 
     async def start(self) -> None:
         self._pw = await async_playwright().start()
-        await self._launch()
+        # ここでの失敗ではアプリを落とさない。Chrome の自動更新と起動が重なると launch が
+        # 失敗することがあり、落ちると cloudflared の転送先が消えて 502 になる。
+        # 起動できなかった場合は、最初の描画要求のときに _ensure_browser で起動し直す
+        try:
+            await self._launch()
+        except PlaywrightError:
+            log.warning("ブラウザを起動できませんでした。最初の要求のときに起動し直します", exc_info=True)
         self._reaper = asyncio.create_task(self._reap())
+
+    async def ensure_ready(self) -> None:
+        """ブラウザが起動していることを確かめ、起動していなければ起動する。
+
+        start() はブラウザの起動に失敗してもアプリを動かし続けるため、ブラウザを
+        今すぐ使えるかどうかを確かめたいときに使う。起動できなければ例外を投げる。
+        """
+        await self._ensure_browser()
 
     async def stop(self) -> None:
         if self._reaper is not None:
@@ -374,7 +388,10 @@ class BrowserPool:
             raise RuntimeError("BrowserPool.start() が呼ばれていません")
         async with self._launch_lock:
             if self._browser is None or not self._browser.is_connected():
-                log.warning("ブラウザとの接続が切れていたため再起動します")
+                if self._browser is not None:
+                    log.warning("ブラウザとの接続が切れていたため再起動します")
+                # 起動に失敗したときに切れたままの参照を残さない（次の要求でまた試す）
+                self._browser = None
                 self._sessions.clear()
                 await self._launch()
         assert self._browser is not None

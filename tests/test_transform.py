@@ -150,7 +150,10 @@ def _render(url: str) -> Snapshot:
         )
         try:
             await pool.start()
+            # start() は起動に失敗してもアプリを落とさないため、ここで明示的に確かめる
+            await pool.ensure_ready()
         except Exception as e:  # noqa: BLE001
+            await pool.stop()
             pytest.skip(f"ブラウザを起動できません: {e}")
         try:
             return await pool.render(url, Viewport(390, 844, 2, False), None, image_quality="low")
