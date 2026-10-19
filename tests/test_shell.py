@@ -36,7 +36,10 @@ def _result(target: str) -> str:
     return (
         f"<!DOCTYPE html><html><head><title>T:{escape(target)}</title></head><body>"
         f'<lp-bar hidden data-page="{escape(target)}"></lp-bar>'
-        f"<p id='target'>{escape(target)}</p><div style='height:3000px'></div></body></html>"
+        f"<p id='target'>{escape(target)}</p>"
+        f'<a id="next" href="/p?u={quote(target + "next/", safe="")}">next</a>'
+        f'<form id="form" action="/p"><input name="u" value="{escape(target)}form/"><button id="send">送信</button></form>'
+        "<div style='height:3000px'></div></body></html>"
     )
 
 
@@ -215,6 +218,10 @@ def test_closing_active_tab_switches_to_neighbor(page):
     assert page.text_content("#lp-tabs-btn") == "1"
 
 
+def history_length(page) -> int:
+    return page.evaluate("history.length")
+
+
 def test_address_shows_original_url(page):
     # liteproxy の URL（/p?u=...・/v?u=...&j=...）ではなく、元のページの URL を表示する
     assert page.input_value("#lp-addr-input") == ""  # ホーム
@@ -224,3 +231,49 @@ def test_address_shows_original_url(page):
     page.press("#lp-addr-input", "Enter")
     wait_title(page, "T:https://slow.example/")
     assert page.input_value("#lp-addr-input") == "https://slow.example/"
+
+
+def test_navigation_inside_tab_does_not_add_browser_history(page):
+    # iframe の履歴はタブの間で共有されるため、iframe 内の移動では履歴を積まない
+    open_url(page, "https://a.example/")
+    before = history_length(page)
+    page.frame_locator("#lp-main iframe.on").locator("#next").click()
+    wait_title(page, "T:https://a.example/next/")
+    page.frame_locator("#lp-main iframe.on").locator("#send").click()
+    wait_title(page, "T:https://a.example/next/form/")
+    open_url(page, "https://b.example/")
+    assert history_length(page) == before
+    page.click("#lp-back")
+    wait_title(page, "T:https://a.example/next/form/")
+    page.click("#lp-back")
+    wait_title(page, "T:https://a.example/next/")
+
+
+def test_device_back_goes_back_in_active_tab(page):
+    # Android の戻るジェスチャーは CloseWatcher で受け取る（デスクトップの Chrome では Esc が同じ扱い）
+    open_url(page, "https://a.example/")
+    open_url(page, "https://b.example/")
+    page.frame_locator("#lp-main iframe.on").locator("#next").click()
+    wait_title(page, "T:https://b.example/next/")
+    before = history_length(page)
+    page.keyboard.press("Escape")  # フォーカスは iframe の中
+    wait_title(page, "T:https://b.example/")
+    page.focus("#lp-back")
+    page.keyboard.press("Escape")  # フォーカスはシェル
+    wait_title(page, "T:https://a.example/")
+    assert history_length(page) == before
+
+
+def test_device_back_is_left_to_browser_when_tab_cannot_go_back(page):
+    # タブで戻れないときは受け取らず、「戻る」でアプリを閉じられるようにする
+    page.focus("#lp-back")
+    assert page.evaluate("window.CloseWatcher !== undefined")
+    page.keyboard.press("Escape")
+    page.wait_for_timeout(200)
+    assert active_title(page) == "home"
+    open_url(page, "https://a.example/")
+    page.click("#lp-back")
+    wait_title(page, "home")
+    page.keyboard.press("Escape")
+    page.wait_for_timeout(200)
+    assert active_title(page) == "home"

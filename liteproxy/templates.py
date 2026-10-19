@@ -120,8 +120,9 @@ _SHELL_CSS = (
 
 # タブごとに iframe を持ち、裏のタブも表示したまま保持する（切り替えで通信しない）。
 # iframe の履歴はタブ（iframe）の間で 1 本につながっているため、history.back() では裏のタブが
-# 戻ることがある。そこで履歴はタブごとにこの JS が持ち、戻る/進むは location.replace で移動する
-# （/v はスマホ側にキャッシュされるため、多くは通信せずに表示できる）。スクロール位置も記録して戻す。
+# 戻ることがある。そこで履歴はタブごとにこの JS が持ち、iframe 内の移動はすべて location.replace で
+# 行ってブラウザの履歴を積まない（/v はスマホ側にキャッシュされるため、戻る/進むの多くは通信せずに
+# 表示できる）。スクロール位置も記録して戻す。端末の「戻る」は CloseWatcher で受け取る。
 # 読み込み中画面（data-lp-loader）は履歴に入れず、同じページの読み込み直しや表示モードの切り替えは
 # 同じ履歴の項目として扱う。開いているタブは localStorage に保存し、開き直したときは表示中の
 # タブだけを読み込む（裏のタブは表示したときに初めて読み込み、通信量を抑える）。
@@ -172,20 +173,47 @@ _SHELL_JS = """
     t.frame.name='lp-view-'+(++seq);
     t.frame.title='liteproxy';
     t.frame.addEventListener('load',function(){loaded(t)});
-    main.insertBefore(t.frame,panel);
     tabs.push(t);
     if(!lazy)open(t);
     return t;
   }
-  // まだ読み込んでいないタブを読み込む
+  // まだ読み込んでいないタブを読み込む。src を設定してから挿入する
+  // （先に挿入して about:blank から移動すると、ブラウザの履歴が 1 つ積まれるため）
   function open(t){
     if(t.opened)return;
     t.opened=true;
     var e=cur(t);
     if(e){t.pending=t.idx;t.frame.src=e.url}else t.frame.src='/';
+    main.insertBefore(t.frame,panel);
+  }
+  // iframe 内の移動は履歴を積まずに置き換える（iframe の履歴はタブの間で共有されるため）。
+  // client.js が既定動作を止めた操作（画像の読み込み・PC 側への中継）と、外部への移動には手を出さない
+  function intercept(w){
+    w.addEventListener('click',function(ev){
+      var a=ev.target.closest&&ev.target.closest('a[href]');
+      if(ev.defaultPrevented||!a||ev.button!==0||ev.ctrlKey||ev.metaKey||ev.shiftKey||ev.altKey)return;
+      if((a.target&&a.target!=='_self')||a.hasAttribute('download')||a.origin!==location.origin)return;
+      ev.preventDefault();
+      w.location.replace(a.href);
+    });
+    // フォームの action などは同名の入力欄で上書きされることがあるため、属性から読む。
+    // 送信ボタンが送信先などを指定している場合は既定の動作に任せる
+    w.addEventListener('submit',function(ev){
+      var f=ev.target,b=ev.submitter,url,data,target=f.getAttribute('target');
+      if(ev.defaultPrevented||(f.getAttribute('method')||'get').toLowerCase()!=='get')return;
+      if((target&&target!=='_self')||(b&&(b.hasAttribute('formaction')||b.hasAttribute('formmethod')||
+        b.hasAttribute('formtarget'))))return;
+      url=new URL(f.getAttribute('action')||'',w.location.href);
+      if(url.origin!==location.origin)return;
+      try{data=new w.FormData(f,b)}catch(e){data=new w.FormData(f)}
+      url.search=new URLSearchParams(data).toString();
+      ev.preventDefault();
+      w.location.replace(url.href);
+    });
   }
   function loaded(t){
     var w=win(t),d=w&&w.document,e,url,bar,page,moved=false;
+    if(d&&w.location.protocol!=='about:')intercept(w);
     if(!d||w.location.protocol==='about:'||d.documentElement.hasAttribute('data-lp-loader')){
       if(t===active)sync();
       return;
@@ -279,6 +307,7 @@ _SHELL_JS = """
     fwd.disabled=fi<0||!t.stack[fi];
     // 入力中の内容は、裏で読み込みが終わっても書き換えない
     if(w&&document.activeElement!==addr)addr.value=pageUrl(t);
+    watch();
     document.title=(d&&d.title)||'liteproxy';
     mode=d&&d.getElementById('lp-mode');
     modeBtn.textContent=mode?mode.textContent:'本文';
@@ -291,6 +320,33 @@ _SHELL_JS = """
     if(el)el.click();
   }
 
+  // 端末の「戻る」（Android の戻るジェスチャー）で、表示中のタブの履歴を戻れるようにする。
+  // iframe 内の移動は履歴を積まないため、そのままでは「戻る」でアプリが閉じる。シェルの履歴に
+  // 項目を積む方法は、Chrome が戻ったときに iframe を積んだ時点の状態へ戻してしまうため使えない。
+  // CloseWatcher は履歴と関係なく「戻る」を受け取れる。フォーカスのある文書で受け取られるため、
+  // シェルと表示中の iframe の両方に置く。タブで戻れないときは置かず、「戻る」でアプリを閉じられる。
+  // デスクトップでは Esc キーでも発火するため、タッチ操作が主の端末だけで使う
+  var watchers=[],watchToken=null,touch=matchMedia('(pointer: coarse)').matches;
+  function watch(){
+    var token={},w=win(active);
+    watchers.forEach(function(x){x.destroy()});
+    watchers=[];
+    watchToken=token;
+    if(!touch||!window.CloseWatcher||!active.stack[backIndex(active)])return;
+    [window,w].forEach(function(g){
+      if(!g||!g.CloseWatcher)return;
+      try{
+        var x=new g.CloseWatcher();
+        x.onclose=function(){
+          if(watchToken!==token)return;  // もう一方の文書で受け取り済み
+          watchToken=null;
+          go(backIndex(active));
+        };
+        watchers.push(x);
+      }catch(e){}
+    });
+  }
+
   // タップでフォーカスしたときは URL 全体を選択し、そのまま打ち替えられるようにする。
   // フォーカス直後の mouseup で選択が解除されるブラウザがあるため、最初の mouseup だけ既定動作を止める
   var fresh=false;
@@ -298,7 +354,14 @@ _SHELL_JS = """
   addr.addEventListener('focus', function(){fresh=true;selectAll();setTimeout(selectAll,0)});
   addr.addEventListener('mouseup', function(e){if(fresh){fresh=false;e.preventDefault();selectAll()}});
   addr.addEventListener('blur', function(){fresh=false;if(!addr.value)sync()});
-  form.addEventListener('submit', function(){active.pending=null;panel.hidden=true;addr.blur()});
+  form.addEventListener('submit', function(ev){
+    var t=active,url='/p?u='+encodeURIComponent(addr.value);
+    ev.preventDefault();
+    t.pending=null;
+    panel.hidden=true;
+    addr.blur();
+    try{t.frame.contentWindow.location.replace(url)}catch(err){t.frame.src=url}
+  });
   back.addEventListener('click', function(){go(backIndex(active))});
   fwd.addEventListener('click', function(){go(fwdIndex(active))});
   imgBtn.addEventListener('click', function(){tap('lp-img')});
