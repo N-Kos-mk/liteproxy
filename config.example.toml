@@ -5,6 +5,9 @@
 # cloudflared からのみ到達させるため、ループバックだけで待ち受ける
 host = "127.0.0.1"
 port = 8700
+# 公開しているホスト名（例: "lp.example.com"）。PC 側で liteproxy 自身を開かないようにする。
+# アクセスされたときの Host ヘッダーの値は自動で加わるため、cloudflared で Host を書き換えていなければ空でよい
+public_hosts = []
 
 [access]
 # Cloudflare Access が付与する JWT をアプリ側でも検証する。外部公開時は true にする

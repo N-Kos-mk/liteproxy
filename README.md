@@ -207,7 +207,7 @@ Start-ScheduledTask -TaskName liteproxy
 
 | セクション | 内容 |
 |---|---|
-| `[server]` | 待ち受けるアドレスとポート（既定：`127.0.0.1:8700`） |
+| `[server]` | 待ち受けるアドレスとポート（既定：`127.0.0.1:8700`）、公開しているホスト名 |
 | `[access]` | Cloudflare AccessのJWTの検証 |
 | `[browser]` | 使うブラウザ、同時に描画する数、待ち時間 |
 | `[render]` | 既定の表示モード、インラインSVGとdata URIの扱い、class名の削減、取り除く要素 |
@@ -223,6 +223,7 @@ Start-ScheduledTask -TaskName liteproxy
 - liteproxyは既定で `127.0.0.1` だけで待ち受けます。外部からは、Cloudflare Tunnelを経由しなければ届きません。
 - Cloudflare Accessで利用者を限定し、liteproxy側でもAccessのJWTを検証します。
 - LANやループバック宛てのURLは、ページとサブリソースのどちらも取得を拒否します（SSRF対策）。ただし、DNSリバインディングまでは防げません。Accessで利用者を限定することが前提です。
+- liteproxy自身のURLはPC側で開きません（開くと描画が際限なく入れ子になるため）。アドレス欄に入力された場合は、URLに含まれる中継先のページを開きます。自身のホスト名はアクセスされたときのHostヘッダーから判断します。cloudflaredでHostヘッダーを書き換えている場合は、`[server] public_hosts` に公開しているホスト名を書いてください。
 - PC側のChromeは、表示するサイトのJavaScriptを実行します。ページごとに独立したブラウザコンテキストを使い、保持をやめるときに破棄します。
 - PC側のChromeでは、ページの写しを作るため、表示するサイト自身のContent-Security-Policyを無効にしています。スマホ側へ返すページには、liteproxyのContent-Security-Policyを付けます。
 - 操作の中継（`/a`）は、liteproxyのページのJavaScriptだけが付ける独自のヘッダーを必須にし、他のサイトからの送信では操作できないようにしています。

@@ -163,6 +163,56 @@ def test_private_url_is_rejected():
     assert renderer.calls == []
 
 
+def test_own_proxy_url_is_unwrapped_instead_of_rendering_itself():
+    # liteproxy 自身の URL を PC 側で開くと描画が際限なく入れ子になるため、中継先を取り出して開く
+    renderer = FakeRenderer()
+    own = "http://testserver/p?u=" + quote("http://testserver/v?u=https%3A%2F%2F8.8.8.8%2F&j=x", safe="")
+    with make_client(renderer) as client:
+        open_page(client, own)
+    assert [c[0] for c in renderer.calls] == ["https://8.8.8.8/"]
+
+
+def test_configured_public_host_is_unwrapped():
+    config = Config()
+    config.server.public_hosts = ["lp.example.com"]
+    renderer = FakeRenderer()
+    with make_client(renderer, config=config) as client:
+        open_page(client, "https://lp.example.com/p?u=https%3A%2F%2F8.8.8.8%2F")
+    assert [c[0] for c in renderer.calls] == ["https://8.8.8.8/"]
+
+
+def test_own_url_without_target_goes_home_and_search_term_goes_to_search():
+    renderer = FakeRenderer()
+    with make_client(renderer) as client:
+        home = client.get("/p", params={"u": "http://testserver/app"})
+        search = client.get("/p", params={"u": "http://testserver/p?u=" + quote("天気", safe="")})
+    assert home.status_code == 303 and home.headers["location"] == "/"
+    assert search.status_code == 303 and search.headers["location"].startswith("/s?q=")
+    assert renderer.calls == []
+
+
+def test_deeply_nested_own_url_is_rejected():
+    renderer = FakeRenderer()
+    url = "https://8.8.8.8/"
+    for _ in range(20):
+        url = "http://testserver/p?u=" + quote(url, safe="")
+    with make_client(renderer) as client:
+        res = client.get("/p", params={"u": url})
+    assert res.status_code == 400
+    assert renderer.calls == []
+
+
+def test_access_failure_does_not_register_self_host():
+    # Access の検証を通らなかった要求の Host は覚えない
+    renderer = FakeRenderer()
+    with make_client(renderer, verifier=_Verifier()) as client:
+        denied = client.get("/", headers={"Host": "8.8.8.8"})
+        assert denied.status_code == 403
+        # 覚えていれば 8.8.8.8 が liteproxy 自身とみなされ、ホームへ戻される
+        open_page(client, "https://8.8.8.8/", headers={"Cf-Access-Jwt-Assertion": "good"})
+    assert [c[0] for c in renderer.calls] == ["https://8.8.8.8/"]
+
+
 def test_loader_then_result_with_phone_viewport():
     renderer = FakeRenderer()
     with make_client(renderer) as client:

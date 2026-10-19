@@ -59,6 +59,19 @@ def unwrap_redirector(url: str) -> str:
     return url
 
 
+def self_inner(url: str) -> str | None:
+    """liteproxy 自身の /p・/v の URL から、中継先として指定されている入力（u の値）を取り出す。"""
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return None
+    if parts.path in ("/p", "/v"):
+        values = parse_qs(parts.query).get("u")
+        if values:
+            return values[0]
+    return None
+
+
 def build_form_target(action: str, fields: list[tuple[str, str]], charset: str) -> str:
     """GET フォームの送信先 URL を作る。HTML の仕様どおり action のクエリは置き換える。"""
     parts = urlsplit(action)

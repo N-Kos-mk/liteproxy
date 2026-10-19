@@ -19,6 +19,9 @@ class ServerConfig:
     # cloudflared からのみ到達させるため、既定ではループバックだけで待ち受ける
     host: str = "127.0.0.1"
     port: int = 8700
+    # 公開しているホスト名（例: lp.example.com）。PC 側でこのホストを開かないようにする。
+    # アクセスされたときの Host ヘッダーの値は自動で加わるため、通常は空でよい
+    public_hosts: list[str] = field(default_factory=list)
 
 
 @dataclass
