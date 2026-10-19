@@ -264,15 +264,21 @@ _SHELL_JS = """
     });
   }
 
+  // アドレス欄には liteproxy の URL ではなく、元のページの URL を表示する
+  // （中継したページはツールバーの data-page、読み込み中画面やエラーは URL の u。ホームなどは空）
+  function pageUrl(t){
+    var w=win(t),bar,e=cur(t);
+    if(w.location.protocol==='about:')return e&&e.page||'';
+    bar=w.document.querySelector('lp-bar');
+    if(bar&&bar.getAttribute('data-page'))return bar.getAttribute('data-page');
+    try{return new URL(w.location.href).searchParams.get('u')||''}catch(err){return ''}
+  }
   function sync(){
-    var t=active,w=win(t),d=w&&w.document,bi=backIndex(t),fi=fwdIndex(t),e=cur(t),mode;
+    var t=active,w=win(t),d=w&&w.document,bi=backIndex(t),fi=fwdIndex(t),mode;
     back.disabled=!t.stack[bi];
     fwd.disabled=fi<0||!t.stack[fi];
     // 入力中の内容は、裏で読み込みが終わっても書き換えない
-    if(document.activeElement!==addr){
-      if(w&&w.location.protocol!=='about:')addr.value=w.location.href;
-      else if(w)addr.value=e?e.url:'';
-    }
+    if(w&&document.activeElement!==addr)addr.value=pageUrl(t);
     document.title=(d&&d.title)||'liteproxy';
     mode=d&&d.getElementById('lp-mode');
     modeBtn.textContent=mode?mode.textContent:'本文';

@@ -99,6 +99,7 @@ def _selection(page) -> list[int]:
 
 
 def test_address_tap_selects_whole_url(page):
+    open_url(page, "https://a.example/")
     length = len(page.input_value("#lp-addr-input"))
     page.tap("#lp-addr-input")
     assert page.evaluate("document.activeElement.id") == "lp-addr-input"
@@ -107,6 +108,7 @@ def test_address_tap_selects_whole_url(page):
 
 
 def test_address_click_selects_whole_url(page):
+    open_url(page, "https://a.example/")
     length = len(page.input_value("#lp-addr-input"))
     page.click("#lp-addr-input")
     page.wait_for_function("document.activeElement.selectionEnd > 0")
@@ -211,3 +213,14 @@ def test_closing_active_tab_switches_to_neighbor(page):
     page.click("#lp-tab-list li.on .lp-x")
     wait_title(page, "home")
     assert page.text_content("#lp-tabs-btn") == "1"
+
+
+def test_address_shows_original_url(page):
+    # liteproxy の URL（/p?u=...・/v?u=...&j=...）ではなく、元のページの URL を表示する
+    assert page.input_value("#lp-addr-input") == ""  # ホーム
+    open_url(page, "https://a.example/")
+    assert page.input_value("#lp-addr-input") == "https://a.example/"
+    page.fill("#lp-addr-input", "https://slow.example/")
+    page.press("#lp-addr-input", "Enter")
+    wait_title(page, "T:https://slow.example/")
+    assert page.input_value("#lp-addr-input") == "https://slow.example/"
