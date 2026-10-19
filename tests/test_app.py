@@ -558,14 +558,14 @@ def test_access_middleware_also_protects_pwa_routes(path):
         assert client.get(path).status_code == 403
 
 
-def test_app_shell_has_address_bar_back_forward_and_iframe():
+def test_app_shell_has_address_bar_back_forward_and_tabs():
     with make_client() as client:
         res = client.get("/app")
     assert res.status_code == 200
-    assert 'id="lp-view"' in res.text and 'name="lp-view"' in res.text
-    assert 'action="/p" target="lp-view"' in res.text
+    # iframe はタブごとにシェルの JS が作る（動作は tests/test_shell.py で確かめる）
+    assert 'id="lp-main"' in res.text and 'id="lp-tabs-btn"' in res.text and 'id="lp-tab-new"' in res.text
+    assert 'id="lp-addr" action="/p"' in res.text
     assert 'id="lp-back"' in res.text and 'id="lp-fwd"' in res.text
-    assert 'src="/"' in res.text
     assert 'id="lp-img-btn"' in res.text and 'id="lp-mode-btn"' in res.text and 'id="lp-orig-btn"' in res.text
     assert "getElementById('lp-img')" in res.text
     assert "getElementById('lp-mode')" in res.text
