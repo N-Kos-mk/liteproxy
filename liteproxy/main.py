@@ -250,7 +250,13 @@ def create_app(
         stats_log.write(stats)
         return stats.gzip_bytes
 
-    jobs = RenderJobs(pool, on_complete=on_complete)
+    jobs = RenderJobs(
+        pool,
+        ttl=config.cache.reuse_minutes * 60,
+        keep=config.cache.keep_minutes * 60,
+        max_finished=config.cache.max_results,
+        on_complete=on_complete,
+    )
 
     def page_mode(request: Request, requested: str = "") -> str:
         """表示モードは、URL の m、Cookie（lp_m）、設定の既定値の順に決める。"""
@@ -271,7 +277,8 @@ def create_app(
             target, viewport, request.headers.get("user-agent", ""), quality, mode or page_mode(request)
         )
 
-    def result_response(result: Snapshot | NonHtml, *, embed: bool = False) -> Response:
+    def result_response(result: Snapshot | NonHtml, *, max_age: int, embed: bool = False) -> Response:
+        """max_age はスマホのブラウザにキャッシュさせる秒数。"""
         nonce = secrets.token_urlsafe(12)
         if isinstance(result, NonHtml):
             size = human(result.size) if result.size is not None else "不明"
@@ -280,7 +287,7 @@ def create_app(
         html, _ = layout.finalize(
             result, nonce, default_quality=default_quality, client_src=CLIENT_SRC, embed=embed
         )
-        return html_response(html, nonce=nonce, max_age=300, language=None, embed=embed)
+        return html_response(html, nonce=nonce, max_age=max_age, language=None, embed=embed)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -437,7 +444,8 @@ def create_app(
         force = f == "1"
         cached = None if force else jobs.cached(key)
         if cached is not None:
-            return keep_mode(result_response(cached, embed=embed))
+            # 同じ URL を新たに開いたときにも使われるため、使い回す期間だけキャッシュさせる
+            return keep_mode(result_response(cached, max_age=config.cache.reuse_minutes * 60, embed=embed))
         # 描画を待たずに読み込み中画面を返し、進捗を流し続ける。完了したら /v へ移動させる。
         # no-transform は Cloudflare に圧縮・加工させず、進捗をため込まずに届けるため
         job = jobs.start(key, force=force)
@@ -458,10 +466,11 @@ def create_app(
         job = jobs.get(j)
         result = job.result if job is not None and job.key.url == target else None
         if result is None:
-            result = jobs.cached(render_key(request, target))
+            result = jobs.cached(render_key(request, target), kept=True)
         if result is None:
             return RedirectResponse(proxy_url(target), status_code=303)
-        return result_response(result, embed=is_embedded(request))
+        # /v はジョブごとに URL が変わり内容も変わらないため、保持する期間いっぱいキャッシュさせてよい
+        return result_response(result, max_age=config.cache.keep_minutes * 60, embed=is_embedded(request))
 
     @app.post("/a")
     async def act(request: Request) -> Response:

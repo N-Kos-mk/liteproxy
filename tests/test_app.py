@@ -178,7 +178,8 @@ def test_loader_then_result_with_phone_viewport():
     assert "<lp-bar " in res.text and "<!--lp-bar-->" not in res.text
     assert "タイトル" in res.text
     assert "1.9MB" in res.text  # PC 側の取得量
-    assert res.headers["cache-control"] == "private, max-age=300"
+    # /v はジョブごとに URL が変わるため、描画結果を保持する期間いっぱいキャッシュさせる
+    assert res.headers["cache-control"] == "private, max-age=1800"
     assert "content-language" not in res.headers  # 中継したページは元の言語に任せる
     nonce = res.headers["content-security-policy"].split("'nonce-")[1].split("'")[0]
     assert f'<script nonce="{nonce}" data-lp-x>' in res.text
@@ -197,7 +198,23 @@ def test_recent_result_is_served_without_loader():
         open_page(client, "https://8.8.8.8/")
         res = client.get("/p", params={"u": "https://8.8.8.8/"})
     assert "<lp-bar " in res.text and "PCで処理しています" not in res.text
+    assert res.headers["cache-control"] == "private, max-age=300"  # 新たに開くときは使い回す期間だけ
     assert len(renderer.calls) == 1
+
+
+def test_view_is_served_after_reuse_period_while_kept():
+    # 使い回す期間を過ぎても、保持している間は /v（戻る・タブの復元）で描画し直さずに表示できる
+    config = Config()
+    config.cache.reuse_minutes = 0
+    renderer = FakeRenderer()
+    with make_client(renderer, config=config) as client:
+        _, first = open_page(client, "https://8.8.8.8/")
+        view = client.get(first.url)
+        assert view.status_code == 200 and "<lp-bar " in view.text
+        assert len(renderer.calls) == 1
+        # 新たに開いた場合は描画し直す
+        open_page(client, "https://8.8.8.8/")
+    assert len(renderer.calls) == 2
 
 
 def test_view_without_result_starts_over():
