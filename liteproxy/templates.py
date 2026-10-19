@@ -133,6 +133,13 @@ _SHELL_JS = """
       modeBtn.disabled=imgBtn.disabled=origBtn.disabled=true;
     }
   }
+  // タップでフォーカスしたときは URL 全体を選択し、そのまま打ち替えられるようにする。
+  // フォーカス直後の mouseup で選択が解除されるブラウザがあるため、最初の mouseup だけ既定動作を止める
+  var fresh=false;
+  function selectAll(){try{addr.setSelectionRange(0,addr.value.length)}catch(e){addr.select()}}
+  addr.addEventListener('focus', function(){fresh=true;selectAll();setTimeout(selectAll,0)});
+  addr.addEventListener('mouseup', function(e){if(fresh){fresh=false;e.preventDefault();selectAll()}});
+  addr.addEventListener('blur', function(){fresh=false});
   frame.addEventListener('load', sync);
   back.addEventListener('click', function(){try{frame.contentWindow.history.back()}catch(e){}});
   fwd.addEventListener('click', function(){try{frame.contentWindow.history.forward()}catch(e){}});
