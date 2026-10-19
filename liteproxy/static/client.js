@@ -11,6 +11,10 @@
   const sized = bar.dataset.q || ''; // 枠に表示しているサイズの画質
   const session = bar.dataset.s || ''; // PC 側で保持しているページ
   let rev = Number(bar.dataset.r || 0); // この HTML の版
+  // /app のシェルの中（タブの iframe）では、ブラウザの履歴を積まずに移動する。
+  // iframe の履歴はタブの間で共有されるため、履歴はシェルがタブごとに管理している
+  const embedded = window.parent !== window;
+  const navigate = (url) => (embedded ? location.replace(url) : location.assign(url));
   const cookie = (name) => {
     const m = document.cookie.match(new RegExp('(?:^|; )' + name + '=([^;]*)'));
     return m ? decodeURIComponent(m[1]) : '';
@@ -301,7 +305,7 @@
 
   function reloadFresh(message) {
     toast(message);
-    location.href = '/p?u=' + encodeURIComponent(page) + '&f=1';
+    navigate('/p?u=' + encodeURIComponent(page) + '&f=1');
   }
 
   let queue = Promise.resolve();
@@ -343,7 +347,7 @@
       const data = await res.json();
       if (data.nav) {
         status('ページを移動しています…');
-        location.href = data.nav;
+        navigate(data.nav);
         return;
       }
       if (data.expired) return reloadFresh('PC側のページの保持期限が切れたため、読み込み直します');
@@ -352,7 +356,7 @@
       if (!apply(data)) return reloadFresh('画面の更新に失敗したため、読み込み直します');
       // ページ内リンクで何も変化しなかった場合は、スマホ側で移動する
       const href = el.getAttribute && el.getAttribute('href');
-      if (!data.ops.length && href && href.length > 1 && href.startsWith('#')) location.hash = href;
+      if (!data.ops.length && href && href.length > 1 && href.startsWith('#')) navigate(href);
     } catch {
       toast('PCとの通信に失敗しました');
     } finally {

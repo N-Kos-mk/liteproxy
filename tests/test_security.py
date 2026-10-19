@@ -52,6 +52,42 @@ def test_allow_private_for_tests():
     assert allowed(HostGuard(allow_private=True), "http://127.0.0.1:8000/")
 
 
+def test_self_host_without_port_blocks_default_ports():
+    # Cloudflare 経由では Host にポートが付かないため、80・443 の両方を自分自身とみなす
+    guard = HostGuard(self_hosts=["LP.example.com"])
+    assert guard.is_self("https://lp.example.com/p?u=x")
+    assert guard.is_self("http://lp.example.com/")
+    assert not guard.is_self("https://lp.example.com:8443/")
+    assert not guard.is_self("https://other.example.com/")
+    assert not allowed(guard, "https://lp.example.com/p?u=https://8.8.8.8/")
+
+
+def test_self_host_with_port_is_port_specific():
+    # テストや LAN 内では、liteproxy と同じアドレスの別ポートのサイトを開けるようにする
+    guard = HostGuard(allow_private=True)
+    guard.add_self_host("127.0.0.1:8700")
+    assert not allowed(guard, "http://127.0.0.1:8700/p?u=x")
+    assert allowed(guard, "http://127.0.0.1:8000/")
+
+
+def test_self_host_ipv6_and_invalid_values():
+    guard = HostGuard()
+    guard.add_self_host("[::1]:8700")
+    guard.add_self_host("bad:port")
+    guard.add_self_host("")
+    assert guard.is_self("http://[::1]:8700/")
+    assert not guard.is_self("http://bad/")
+
+
+def test_self_hosts_are_capped():
+    guard = HostGuard()
+    for i in range(HostGuard.MAX_SELF_HOSTS):
+        guard.add_self_host(f"h{i}.example.com:1")
+    guard.add_self_host("late.example.com")
+    assert guard.is_self("http://h0.example.com:1/")
+    assert not guard.is_self("https://late.example.com/")
+
+
 # ---------------------------------------------------------------- Access JWT
 
 TEAM = "team.cloudflareaccess.com"

@@ -87,3 +87,39 @@ def test_old_results_expire():
         assert jobs.cached(KEY) is None and jobs.get(job.id) is None
 
     asyncio.run(run())
+
+
+def test_kept_result_outlives_reuse_period():
+    async def run():
+        renderer = SlowRenderer(["html", "html2"])
+        renderer.release.set()
+        jobs = RenderJobs(renderer, ttl=0.0, keep=60.0)
+        job = jobs.start(KEY)
+        await job.task
+        # 使い回す期間は過ぎているが、ジョブの指定や kept では保持している結果を返す
+        assert jobs.cached(KEY) is None
+        assert jobs.cached(KEY, kept=True) == "html"
+        assert jobs.get(job.id) is job
+        # 新たな要求では描画し直す
+        again = jobs.start(KEY)
+        assert again is not job
+        await again.task
+        assert renderer.calls == 2 and jobs.get(job.id) is job
+
+    asyncio.run(run())
+
+
+def test_max_finished_drops_oldest():
+    async def run():
+        renderer = SlowRenderer(["a", "b", "c"])
+        renderer.release.set()
+        jobs = RenderJobs(renderer, keep=60.0, max_finished=2)
+        done = []
+        for path in ("a", "b", "c"):
+            job = jobs.start(RenderKey(f"https://8.8.8.8/{path}", KEY.viewport, "UA"))
+            await job.task
+            done.append(job)
+        assert jobs.get(done[0].id) is None
+        assert jobs.get(done[1].id) is done[1] and jobs.get(done[2].id) is done[2]
+
+    asyncio.run(run())

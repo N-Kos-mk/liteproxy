@@ -26,17 +26,27 @@ class HostGuard:
     名前解決した結果がすべてグローバルアドレスの場合だけ許可する。PC の Chrome は
     外部サイトの JS も実行するため、ページの取得だけでなくサブリソースにも適用する。
     DNS リバインディングまでは防げないため、Access による利用者の限定が前提となる。
+
+    liteproxy 自身（公開しているホスト名）も拒否する。PC 側で自分自身を開くと、その中で
+    また描画が始まり、入れ子の描画が際限なく続くため。
     """
+
+    # Host ヘッダーから覚える自分自身のホストの上限（偽の Host を大量に送られても増え続けないように）
+    MAX_SELF_HOSTS = 64
 
     def __init__(
         self,
         *,
         allow_private: bool = False,
         block_domains: Iterable[str] = (),
+        self_hosts: Iterable[str] = (),
         ttl: float = 300.0,
     ) -> None:
         self._allow_private = allow_private
         self._block_domains = tuple(d.lower().strip(".") for d in block_domains if d)
+        self._self: set[tuple[str, int]] = set()
+        for host in self_hosts:
+            self.add_self_host(host)
         self._ttl = ttl
         self._cache: dict[str, tuple[float, bool]] = {}
 
@@ -48,7 +58,7 @@ class HostGuard:
             return False
         if parts.scheme not in ("http", "https") or not host:
             return False
-        if self.is_blocked_domain(host):
+        if self.is_blocked_domain(host) or self.is_self(url):
             return False
         if self._allow_private:
             return True
@@ -65,6 +75,35 @@ class HostGuard:
 
     def is_blocked_domain(self, host: str) -> bool:
         return any(host == d or host.endswith("." + d) for d in self._block_domains)
+
+    def add_self_host(self, host: str) -> None:
+        """liteproxy 自身のホスト（Host ヘッダーの値、または設定の public_hosts）を登録する。
+
+        ポートが付いていなければ、外部での既定のポート（80・443）を自分自身とみなす。
+        Cloudflare 経由では Host にポートが付かず、外部での scheme も分からないため。
+        ポートまで区別するのは、テストや LAN 内で同じアドレスの別ポートのサイトを開けるようにするため。
+        """
+        try:
+            parts = urlsplit("//" + host.strip())
+            name = (parts.hostname or "").rstrip(".")
+            port = parts.port
+        except ValueError:
+            return
+        if not name:
+            return
+        entries = {(name, port)} if port is not None else {(name, 80), (name, 443)}
+        if len(self._self | entries) <= self.MAX_SELF_HOSTS:
+            self._self |= entries
+
+    def is_self(self, url: str) -> bool:
+        """url が liteproxy 自身を指しているか。"""
+        try:
+            parts = urlsplit(url)
+            name = (parts.hostname or "").rstrip(".")
+            port = parts.port or {"http": 80, "https": 443}.get(parts.scheme)
+        except ValueError:
+            return False
+        return (name, port) in self._self
 
     @staticmethod
     async def _resolves_to_public(host: str) -> bool:

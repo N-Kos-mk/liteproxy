@@ -19,6 +19,9 @@ class ServerConfig:
     # cloudflared からのみ到達させるため、既定ではループバックだけで待ち受ける
     host: str = "127.0.0.1"
     port: int = 8700
+    # 公開しているホスト名（例: lp.example.com）。PC 側でこのホストを開かないようにする。
+    # アクセスされたときの Host ヘッダーの値は自動で加わるため、通常は空でよい
+    public_hosts: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -78,6 +81,15 @@ class SessionConfig:
 
 
 @dataclass
+class CacheConfig:
+    # 同じページを新たに開いたとき、この時間内の描画結果があれば描画し直さずに使う
+    reuse_minutes: int = 5
+    # 描画結果を保持する時間。戻る操作やタブの復元では、この間は描画し直さずに表示できる
+    keep_minutes: int = 30
+    max_results: int = 100  # 保持する描画結果の数の上限（1 件あたり数十〜数百 KB）
+
+
+@dataclass
 class ImageConfig:
     default_quality: str = "mid"  # 画質を選んでいないときの既定（low / mid / high / orig）
     precompute: bool = True  # 描画時に既定の画質へ変換し、画像の枠にサイズを表示する
@@ -133,6 +145,7 @@ class Config:
     browser: BrowserConfig = field(default_factory=BrowserConfig)
     render: RenderConfig = field(default_factory=RenderConfig)
     session: SessionConfig = field(default_factory=SessionConfig)
+    cache: CacheConfig = field(default_factory=CacheConfig)
     image: ImageConfig = field(default_factory=ImageConfig)
     network: NetworkConfig = field(default_factory=NetworkConfig)
     search: SearchConfig = field(default_factory=SearchConfig)
@@ -145,6 +158,7 @@ _SECTIONS = {
     "browser": BrowserConfig,
     "render": RenderConfig,
     "session": SessionConfig,
+    "cache": CacheConfig,
     "image": ImageConfig,
     "network": NetworkConfig,
     "search": SearchConfig,
@@ -180,6 +194,11 @@ def load_config(path: Path | None) -> Config:
         raise ConfigError("[search] url には {q} を含めてください")
     if config.render.default_mode not in ("layout", "reader"):
         raise ConfigError("[render] default_mode は layout か reader にしてください")
+    cache = config.cache
+    if cache.keep_minutes < 1 or cache.max_results < 1 or not 0 <= cache.reuse_minutes <= cache.keep_minutes:
+        raise ConfigError(
+            "[cache] は keep_minutes と max_results を 1 以上、reuse_minutes を 0 以上 keep_minutes 以下にしてください"
+        )
     if config.image.default_quality not in ("low", "mid", "high", "orig"):
         raise ConfigError("[image] default_quality は low / mid / high / orig のいずれかにしてください")
     return config

@@ -106,12 +106,19 @@ class RenderJobs:
         renderer: Renderer,
         *,
         ttl: float = 300.0,
+        keep: float | None = None,
         max_finished: int = 30,
         on_complete: Callable[[Job, Snapshot | NonHtml], int | None] | None = None,
     ) -> None:
-        """on_complete は完了時に呼ばれ、スマホへの送信量の目安（バイト）を返す。"""
+        """ttl は同じ条件の要求に結果を使い回す時間、keep は結果を保持する時間（None なら ttl と同じ）。
+
+        新たに開いたページには古すぎない結果だけを使い、ジョブを指定した表示（戻る・タブの復元）では
+        keep の間は描画し直さずに済むよう、2 つを分けている。
+        on_complete は完了時に呼ばれ、スマホへの送信量の目安（バイト）を返す。
+        """
         self._renderer = renderer
         self._ttl = ttl
+        self._keep = max(ttl, keep if keep is not None else ttl)
         self._max_finished = max_finished
         self._on_complete = on_complete
         self._jobs: dict[str, Job] = {}
@@ -120,9 +127,10 @@ class RenderJobs:
     def get(self, job_id: str) -> Job | None:
         return self._jobs.get(job_id)
 
-    def cached(self, key: RenderKey) -> Snapshot | NonHtml | None:
+    def cached(self, key: RenderKey, *, kept: bool = False) -> Snapshot | NonHtml | None:
+        """kept なら使い回す期間を過ぎていても、保持している間の結果を返す。"""
         job = self._by_key.get(key)
-        if job is not None and job.result is not None and self._fresh(job):
+        if job is not None and job.result is not None and (self._kept(job) if kept else self._fresh(job)):
             return job.result
         return None
 
@@ -185,11 +193,14 @@ class RenderJobs:
     def _fresh(self, job: Job) -> bool:
         return job.finished is not None and time.monotonic() - job.finished < self._ttl
 
+    def _kept(self, job: Job) -> bool:
+        return job.finished is not None and time.monotonic() - job.finished < self._keep
+
     def _prune(self) -> None:
         finished = sorted((j for j in self._jobs.values() if j.done), key=lambda j: j.finished or 0)
         excess = len(finished) - self._max_finished
         for i, job in enumerate(finished):
-            if i < excess or not self._fresh(job):
+            if i < excess or not self._kept(job):
                 del self._jobs[job.id]
                 if self._by_key.get(job.key) is job:
                     del self._by_key[job.key]

@@ -96,68 +96,315 @@ _SHELL_CSS = (
     "padding-top:calc(6px + env(safe-area-inset-top));background:#1f2328;color:#d0d7de;flex-wrap:wrap}"
     "#lp-top button{font:inherit;padding:6px 10px;border:0;border-radius:6px;background:#30363d;color:#e6edf3}"
     "#lp-top button:disabled{opacity:.4}"
+    "#lp-top #lp-tabs-btn{min-width:2.4em;padding:4px 8px;border:2px solid #8b949e;font-weight:600}"
     "#lp-addr{flex:1;display:flex;gap:6px;min-width:120px}"
     "#lp-addr input{flex:1;min-width:0;font:inherit;padding:6px 8px;border:0;border-radius:6px}"
-    "#lp-view{flex:1 1 auto;width:100%;border:0}"
+    "#lp-main{flex:1 1 auto;position:relative}"
+    # 裏のタブは display:none ではなく visibility で隠す。裏で読み込みが終わったページでも、
+    # client.js が画面の寸法を正しく測れるようにするため
+    "#lp-main iframe{position:absolute;inset:0;width:100%;height:100%;border:0;visibility:hidden}"
+    "#lp-main iframe.on{visibility:visible}"
+    "#lp-tabs{position:absolute;inset:0;z-index:1;overflow:auto;padding:8px;box-sizing:border-box;"
+    "background:Canvas;color:CanvasText}"
+    "#lp-tabs[hidden]{display:none}"
+    "#lp-tab-list{list-style:none;margin:0 0 8px;padding:0}"
+    "#lp-tab-list li{display:flex;margin-bottom:6px;border:1px solid #8886;border-radius:8px;overflow:hidden}"
+    "#lp-tab-list li.on{border-color:#3b82f6;box-shadow:inset 4px 0 #3b82f6}"
+    ".lp-tab{flex:1;min-width:0;text-align:left;font:inherit;padding:8px 12px;border:0;background:none;color:inherit}"
+    ".lp-tab span{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}"
+    ".lp-tab .h{font-size:12px;opacity:.7}"
+    ".lp-x{flex:0 0 auto;font:20px/1 system-ui,sans-serif;padding:0 16px;border:0;background:none;color:inherit}"
+    "#lp-tab-new{width:100%;font:inherit;padding:10px;border:1px dashed #8889;border-radius:8px;"
+    "background:none;color:inherit}"
 )
 
-# 戻る/進むは常に有効にして呼ぶだけにする（iframe の履歴が実際に戻れるかを事前に知る手段がないため）。
+# タブごとに iframe を持ち、裏のタブも表示したまま保持する（切り替えで通信しない）。
+# iframe の履歴はタブ（iframe）の間で 1 本につながっているため、history.back() では裏のタブが
+# 戻ることがある。そこで履歴はタブごとにこの JS が持ち、iframe 内の移動はすべて location.replace で
+# 行ってブラウザの履歴を積まない（/v はスマホ側にキャッシュされるため、戻る/進むの多くは通信せずに
+# 表示できる）。スクロール位置も記録して戻す。端末の「戻る」は CloseWatcher で受け取る。
+# 読み込み中画面（data-lp-loader）は履歴に入れず、同じページの読み込み直しや表示モードの切り替えは
+# 同じ履歴の項目として扱う。開いているタブは localStorage に保存し、開き直したときは表示中の
+# タブだけを読み込む（裏のタブは表示したときに初めて読み込み、通信量を抑える）。
 # 「画像」「本文/全体」「元」は、iframe 内の（埋め込み時は隠れている）ツールバーの対応する要素を
 # プログラム的にクリックすることで実現し、client.js 側は無変更のままにする。
 # ツールバーの無いページ（ホームなど）では対象の要素が無いので、その場合はボタンを無効にする。
-# 同期はすべて iframe の load イベントで行い、元ページへ移動後など同一オリジンでなくなった場合に
-# 参照が例外を投げても、直前の表示のまま保持できるよう必ず try/catch で守る。
+# 元ページへ移動後など同一オリジンでなくなった場合は iframe の中を参照できないため、win() で守る。
 _SHELL_JS = """
 (function(){
-  var frame=document.getElementById('lp-view');
+  var main=document.getElementById('lp-main'), panel=document.getElementById('lp-tabs');
+  var list=document.getElementById('lp-tab-list'), tabsBtn=document.getElementById('lp-tabs-btn');
   var back=document.getElementById('lp-back'), fwd=document.getElementById('lp-fwd');
-  var addr=document.getElementById('lp-addr-input');
+  var form=document.getElementById('lp-addr'), addr=document.getElementById('lp-addr-input');
   var imgBtn=document.getElementById('lp-img-btn'), modeBtn=document.getElementById('lp-mode-btn');
   var origBtn=document.getElementById('lp-orig-btn');
-  function tap(id){
+  var KEY='lp-tabs', MAX_STACK=30, tabs=[], active=null, seq=0;
+
+  function win(t){try{return t.frame.contentWindow.location.href?t.frame.contentWindow:null}catch(e){return null}}
+  function cur(t){return t.stack[t.idx]||null}
+  // 表示中の文書が履歴の現在の項目か（読み込み中画面やエラーのままのときは偽）
+  function shown(t){var w=win(t),e=cur(t);return !!(w&&e&&w.location.href===e.url)}
+  function backIndex(t){return shown(t)?t.idx-1:t.idx}
+  function fwdIndex(t){return shown(t)?t.idx+1:-1}
+
+  function save(){
     try{
-      var el=frame.contentDocument.getElementById(id);
-      if(el) el.click();
+      localStorage.setItem(KEY,JSON.stringify({active:tabs.indexOf(active),tabs:tabs.map(function(t){
+        return {idx:t.idx,stack:t.stack.map(function(e){return {url:e.url,page:e.page,title:e.title,scroll:e.scroll||0}})};
+      })}));
     }catch(e){}
   }
-  function sync(){
-    try{
-      addr.value=frame.contentWindow.location.href;
-      document.title=frame.contentDocument.title||'liteproxy';
-      var mode=frame.contentDocument.getElementById('lp-mode');
-      modeBtn.textContent=mode?mode.textContent:'本文';
-      modeBtn.disabled=!mode;
-      imgBtn.disabled=!frame.contentDocument.getElementById('lp-img');
-      origBtn.disabled=!frame.contentDocument.getElementById('lp-orig');
-    }catch(e){
-      modeBtn.disabled=imgBtn.disabled=origBtn.disabled=true;
-    }
+  function restore(){
+    var s;
+    try{s=JSON.parse(localStorage.getItem(KEY))}catch(e){}
+    if(!s||!s.tabs||!s.tabs.length)return false;
+    s.tabs.forEach(function(x){
+      var stack=(x.stack||[]).filter(function(e){
+        return e&&typeof e.url==='string'&&e.url.indexOf(location.origin+'/')===0;
+      });
+      create(stack,Math.min(Math.max(x.idx|0,0),stack.length-1),true);
+    });
+    activate(tabs[s.active]||tabs[0]);
+    return true;
   }
-  frame.addEventListener('load', sync);
-  back.addEventListener('click', function(){try{frame.contentWindow.history.back()}catch(e){}});
-  fwd.addEventListener('click', function(){try{frame.contentWindow.history.forward()}catch(e){}});
+
+  function create(stack,idx,lazy){
+    var t={stack:stack||[],idx:idx==null?-1:idx,pending:null,opened:false,frame:document.createElement('iframe')};
+    t.frame.name='lp-view-'+(++seq);
+    t.frame.title='liteproxy';
+    t.frame.addEventListener('load',function(){loaded(t)});
+    tabs.push(t);
+    if(!lazy)open(t);
+    return t;
+  }
+  // まだ読み込んでいないタブを読み込む。src を設定してから挿入する
+  // （先に挿入して about:blank から移動すると、ブラウザの履歴が 1 つ積まれるため）
+  function open(t){
+    if(t.opened)return;
+    t.opened=true;
+    var e=cur(t);
+    if(e){t.pending=t.idx;t.frame.src=e.url}else t.frame.src='/';
+    main.insertBefore(t.frame,panel);
+  }
+  // iframe 内の移動は履歴を積まずに置き換える（iframe の履歴はタブの間で共有されるため）。
+  // client.js が既定動作を止めた操作（画像の読み込み・PC 側への中継）と、外部への移動には手を出さない
+  function intercept(w){
+    w.addEventListener('click',function(ev){
+      var a=ev.target.closest&&ev.target.closest('a[href]');
+      if(ev.defaultPrevented||!a||ev.button!==0||ev.ctrlKey||ev.metaKey||ev.shiftKey||ev.altKey)return;
+      if((a.target&&a.target!=='_self')||a.hasAttribute('download')||a.origin!==location.origin)return;
+      ev.preventDefault();
+      w.location.replace(a.href);
+    });
+    // フォームの action などは同名の入力欄で上書きされることがあるため、属性から読む。
+    // 送信ボタンが送信先などを指定している場合は既定の動作に任せる
+    w.addEventListener('submit',function(ev){
+      var f=ev.target,b=ev.submitter,url,data,target=f.getAttribute('target');
+      if(ev.defaultPrevented||(f.getAttribute('method')||'get').toLowerCase()!=='get')return;
+      if((target&&target!=='_self')||(b&&(b.hasAttribute('formaction')||b.hasAttribute('formmethod')||
+        b.hasAttribute('formtarget'))))return;
+      url=new URL(f.getAttribute('action')||'',w.location.href);
+      if(url.origin!==location.origin)return;
+      try{data=new w.FormData(f,b)}catch(e){data=new w.FormData(f)}
+      url.search=new URLSearchParams(data).toString();
+      ev.preventDefault();
+      w.location.replace(url.href);
+    });
+  }
+  function loaded(t){
+    var w=win(t),d=w&&w.document,e,url,bar,page,moved=false;
+    if(d&&w.location.protocol!=='about:')intercept(w);
+    if(!d||w.location.protocol==='about:'||d.documentElement.hasAttribute('data-lp-loader')){
+      if(t===active)sync();
+      return;
+    }
+    url=w.location.href;
+    bar=d.querySelector('lp-bar');
+    page=bar?bar.getAttribute('data-page')||'':'';
+    e=cur(t);
+    if(t.pending!==null&&t.stack[t.pending]){t.idx=t.pending;e=cur(t);moved=true}
+    else if(e&&(e.url===url||(page&&e.page===page))){}
+    else if(t.stack[t.idx-1]&&t.stack[t.idx-1].url===url){t.idx--;e=cur(t)}
+    else if(t.stack[t.idx+1]&&t.stack[t.idx+1].url===url){t.idx++;e=cur(t)}
+    else{
+      t.stack.splice(t.idx+1);
+      e={};
+      t.stack.push(e);
+      if(t.stack.length>MAX_STACK)t.stack.shift();
+      t.idx=t.stack.length-1;
+    }
+    t.pending=null;
+    e.url=url;e.page=page;e.title=d.title||'';
+    if(moved&&e.scroll)w.scrollTo(0,e.scroll);
+    w.addEventListener('pagehide',function(){e.scroll=w.scrollY||0;save()});
+    if(t===active)sync();
+    render();
+    save();
+  }
+
+  function activate(t){
+    active=t;
+    tabs.forEach(function(x){x.frame.className=x===t?'on':''});
+    form.target=t.frame.name;
+    open(t);
+    sync();
+    render();
+    save();
+  }
+  function close(t){
+    var i=tabs.indexOf(t);
+    tabs.splice(i,1);
+    t.frame.remove();
+    if(!tabs.length)create();
+    if(t===active)activate(tabs[Math.min(i,tabs.length-1)]);
+    else{render();save()}
+  }
+  function go(i){
+    var t=active,e=t.stack[i];
+    if(i<0||!e)return;
+    t.pending=i;
+    try{t.frame.contentWindow.location.replace(e.url)}catch(err){t.frame.src=e.url}
+  }
+
+  function host(url){try{return new URL(url).host}catch(e){return ''}}
+  function render(){
+    tabsBtn.textContent=tabs.length;
+    if(panel.hidden)return;
+    list.textContent='';
+    tabs.forEach(function(t){
+      var e=cur(t)||{},li=document.createElement('li'),b=document.createElement('button');
+      var x=document.createElement('button'),title=document.createElement('span'),sub=document.createElement('span');
+      if(t===active)li.className='on';
+      b.type=x.type='button';
+      b.className='lp-tab';
+      title.textContent=e.title||(e.page?host(e.page):'新しいタブ');
+      sub.className='h';
+      sub.textContent=e.page?host(e.page):'liteproxy';
+      b.appendChild(title);b.appendChild(sub);
+      b.addEventListener('click',function(){panel.hidden=true;activate(t)});
+      x.className='lp-x';
+      x.textContent='\\u00d7';
+      x.title='タブを閉じる';
+      x.setAttribute('aria-label','タブを閉じる');
+      x.addEventListener('click',function(){close(t)});
+      li.appendChild(b);li.appendChild(x);
+      list.appendChild(li);
+    });
+  }
+
+  // アドレス欄には liteproxy の URL ではなく、元のページの URL を表示する
+  // （中継したページはツールバーの data-page、読み込み中画面やエラーは URL の u。ホームなどは空）
+  function pageUrl(t){
+    var w=win(t),bar,e=cur(t);
+    if(w.location.protocol==='about:')return e&&e.page||'';
+    bar=w.document.querySelector('lp-bar');
+    if(bar&&bar.getAttribute('data-page'))return bar.getAttribute('data-page');
+    try{return new URL(w.location.href).searchParams.get('u')||''}catch(err){return ''}
+  }
+  function sync(){
+    var t=active,w=win(t),d=w&&w.document,bi=backIndex(t),fi=fwdIndex(t),mode;
+    back.disabled=!t.stack[bi];
+    fwd.disabled=fi<0||!t.stack[fi];
+    // 入力中の内容は、裏で読み込みが終わっても書き換えない
+    if(w&&document.activeElement!==addr)addr.value=pageUrl(t);
+    watch();
+    document.title=(d&&d.title)||'liteproxy';
+    mode=d&&d.getElementById('lp-mode');
+    modeBtn.textContent=mode?mode.textContent:'本文';
+    modeBtn.disabled=!mode;
+    imgBtn.disabled=!(d&&d.getElementById('lp-img'));
+    origBtn.disabled=!(d&&d.getElementById('lp-orig'));
+  }
+  function tap(id){
+    var w=win(active),el=w&&w.document.getElementById(id);
+    if(el)el.click();
+  }
+
+  // 端末の「戻る」（Android の戻るジェスチャー）で、表示中のタブの履歴を戻れるようにする。
+  // iframe 内の移動は履歴を積まないため、そのままでは「戻る」でアプリが閉じる。シェルの履歴に
+  // 項目を積む方法は、Chrome が戻ったときに iframe を積んだ時点の状態へ戻してしまうため使えない。
+  // CloseWatcher は履歴と関係なく「戻る」を受け取れる。フォーカスのある文書で受け取られるため、
+  // シェルと表示中の iframe の両方に置く。タブで戻れないときは置かず、「戻る」でアプリを閉じられる。
+  // デスクトップでは Esc キーでも発火するため、タッチ操作が主の端末だけで使う
+  var watchers=[],watchToken=null,touch=matchMedia('(pointer: coarse)').matches;
+  function watch(){
+    var token={},w=win(active);
+    watchers.forEach(function(x){x.destroy()});
+    watchers=[];
+    watchToken=token;
+    if(!touch||!window.CloseWatcher||!active.stack[backIndex(active)])return;
+    [window,w].forEach(function(g){
+      if(!g||!g.CloseWatcher)return;
+      try{
+        var x=new g.CloseWatcher();
+        x.onclose=function(){
+          if(watchToken!==token)return;  // もう一方の文書で受け取り済み
+          watchToken=null;
+          go(backIndex(active));
+        };
+        watchers.push(x);
+      }catch(e){}
+    });
+  }
+
+  // タップでフォーカスしたときは URL 全体を選択し、そのまま打ち替えられるようにする。
+  // フォーカス直後の mouseup で選択が解除されるブラウザがあるため、最初の mouseup だけ既定動作を止める
+  var fresh=false;
+  function selectAll(){try{addr.setSelectionRange(0,addr.value.length)}catch(e){addr.select()}}
+  addr.addEventListener('focus', function(){fresh=true;selectAll();setTimeout(selectAll,0)});
+  addr.addEventListener('mouseup', function(e){if(fresh){fresh=false;e.preventDefault();selectAll()}});
+  addr.addEventListener('blur', function(){fresh=false;if(!addr.value)sync()});
+  form.addEventListener('submit', function(ev){
+    var t=active,url='/p?u='+encodeURIComponent(addr.value);
+    ev.preventDefault();
+    t.pending=null;
+    panel.hidden=true;
+    addr.blur();
+    try{t.frame.contentWindow.location.replace(url)}catch(err){t.frame.src=url}
+  });
+  back.addEventListener('click', function(){go(backIndex(active))});
+  fwd.addEventListener('click', function(){go(fwdIndex(active))});
   imgBtn.addEventListener('click', function(){tap('lp-img')});
   modeBtn.addEventListener('click', function(){tap('lp-mode')});
   origBtn.addEventListener('click', function(){tap('lp-orig')});
+  tabsBtn.addEventListener('click', function(){panel.hidden=!panel.hidden;render()});
+  document.getElementById('lp-tab-new').addEventListener('click', function(){
+    panel.hidden=true;
+    activate(create());
+    addr.value='';
+    addr.focus();
+  });
+  // アプリを閉じる前に、表示中の位置を保存しておく
+  document.addEventListener('visibilitychange', function(){
+    if(document.visibilityState!=='hidden')return;
+    tabs.forEach(function(t){var w=win(t);if(shown(t))cur(t).scroll=w.scrollY||0});
+    save();
+  });
+  if(!restore())activate(create());
 })();
 """
 
 
 def shell(nonce: str, *, icon_src: str) -> str:
-    """/app: 外枠（アドレス欄・戻る/進む・画像/本文切替/元ページ）と、中身を表示する iframe。"""
+    """/app: 外枠（アドレス欄・戻る/進む・タブ・画像/本文切替/元ページ）と、タブごとに中身を表示する iframe。
+
+    iframe はシェルの JS がタブごとに作る。
+    """
     body = (
         '<div id="lp-top">'
         '<button type="button" id="lp-back">戻る</button>'
         '<button type="button" id="lp-fwd">進む</button>'
-        '<form id="lp-addr" action="/p" target="lp-view">'
+        '<form id="lp-addr" action="/p">'
         '<input id="lp-addr-input" name="u" type="search" placeholder="URL または検索語" '
         'autocapitalize="off" autocomplete="off" enterkeyhint="go">'
         "<button>開く</button></form>"
+        '<button type="button" id="lp-tabs-btn" title="タブの一覧" aria-label="タブの一覧">1</button>'
         '<button type="button" id="lp-img-btn" title="画像の読み込みと画質の設定">画像</button>'
         '<button type="button" id="lp-mode-btn" title="表示モードを切り替える">本文</button>'
         '<button type="button" id="lp-orig-btn" title="元のページを直接開く（通信量に注意）">元</button>'
         "</div>"
-        '<iframe name="lp-view" id="lp-view" src="/" title="liteproxy"></iframe>'
+        '<div id="lp-main"><div id="lp-tabs" hidden><ul id="lp-tab-list"></ul>'
+        '<button type="button" id="lp-tab-new">新しいタブ</button></div></div>'
     )
     head_extra = f"<style>{_SHELL_CSS}</style>" + _pwa_head_tags(icon_src)
     body_extra = env_script(nonce) + _sw_register_script(nonce) + f'<script nonce="{nonce}">{_SHELL_JS}</script>'
@@ -239,7 +486,8 @@ def loader_page(target: str, nonce: str) -> str:
     """読み込み中画面の先頭部分。末尾は閉じず、loader_update() を順に追記する。"""
     host = urlsplit(target).hostname or target
     return (
-        '<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8">'
+        # data-lp-loader は /app のシェルが、読み込み中画面をタブの履歴に入れないための目印
+        '<!DOCTYPE html><html lang="ja" data-lp-loader><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
         f"<title>読み込み中 - {escape(host)}</title><style>{_LOADER_CSS}</style></head><body><main>"
         '<div class="sp" id="sp"></div><h1 id="t">PCで処理しています</h1>'

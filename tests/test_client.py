@@ -149,3 +149,39 @@ def test_toolbar_stays_at_the_top_while_scrolling(page):
     page.wait_for_timeout(100)
     assert page.evaluate("scrollY") > 1000
     assert page.evaluate("Math.round(document.querySelector('lp-bar').getBoundingClientRect().top)") == 0
+
+
+NAV_PAGE = f"""<!DOCTYPE html><html><head><meta charset="utf-8"><style>{BAR_CSS}</style></head><body>
+<lp-bar data-page="https://e.com/article" data-q="" data-dq="mid" data-s="sess" data-r="0"></lp-bar>
+<button id="ui" data-lp-t>開く</button>
+<script src="/static/client.js"></script>
+</body></html>"""
+
+
+@pytest.mark.parametrize("embedded", [False, True])
+def test_navigation_from_relay_replaces_history_only_when_embedded(browser, embedded):
+    # /app のシェル（iframe）の中では、タブの履歴をシェルが管理するためブラウザの履歴を積まない
+    def handle(route):
+        path = urlsplit(route.request.url).path
+        if path == "/page":
+            route.fulfill(content_type="text/html; charset=utf-8", body=NAV_PAGE)
+        elif path == "/shell":
+            route.fulfill(content_type="text/html", body='<iframe id="f" src="/page"></iframe>')
+        elif path == "/static/client.js":
+            route.fulfill(content_type="text/javascript", body=CLIENT_JS)
+        elif path == "/a":
+            route.fulfill(content_type="application/json", body='{"nav": "/next"}')
+        else:
+            route.fulfill(content_type="text/html", body="<p id='next'>next</p>")
+
+    context = browser.new_context()
+    p = context.new_page()
+    p.route("http://lp.test/**", handle)
+    p.goto("http://lp.test/shell" if embedded else "http://lp.test/page")
+    frame = p.frame_locator("#f") if embedded else p
+    frame.locator("#ui").wait_for()
+    before = p.evaluate("history.length")
+    frame.locator("#ui").click()
+    frame.locator("#next").wait_for()
+    assert p.evaluate("history.length") == (before if embedded else before + 1)
+    context.close()

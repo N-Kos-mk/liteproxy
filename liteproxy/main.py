@@ -39,6 +39,7 @@ from .urls import (
     build_form_target,
     normalize_input,
     proxy_url,
+    self_inner,
     unwrap_redirector,
 )
 
@@ -128,6 +129,9 @@ self.addEventListener("fetch", (event) => {{
 
 # 表示モード（layout: レイアウトを保つ / reader: 本文だけ）
 MODES = ("layout", "reader")
+
+# /p で liteproxy 自身の URL を剥がす回数の上限（入れ子の URL を延々と処理しないように）
+SELF_UNWRAP_LIMIT = 10
 
 # 読み込み中画面へ、段階に変化がなくてもこの間隔で生存通知を送る
 LOADER_HEARTBEAT_SEC = 2.0
@@ -234,7 +238,11 @@ def create_app(
     renderer: Renderer | None = None,
     verifier: AccessVerifier | None = None,
 ) -> FastAPI:
-    guard = HostGuard(allow_private=config.network.allow_private, block_domains=config.network.block_domains)
+    guard = HostGuard(
+        allow_private=config.network.allow_private,
+        block_domains=config.network.block_domains,
+        self_hosts=config.server.public_hosts,
+    )
     mb = 1024 * 1024
     images = ImageStore(guard, cache_bytes=config.image.cache_mb * mb, max_image_bytes=config.image.max_image_mb * mb)
     pool: Renderer = renderer or BrowserPool(config.browser, config.render, guard, images, config.session)
@@ -250,7 +258,13 @@ def create_app(
         stats_log.write(stats)
         return stats.gzip_bytes
 
-    jobs = RenderJobs(pool, on_complete=on_complete)
+    jobs = RenderJobs(
+        pool,
+        ttl=config.cache.reuse_minutes * 60,
+        keep=config.cache.keep_minutes * 60,
+        max_finished=config.cache.max_results,
+        on_complete=on_complete,
+    )
 
     def page_mode(request: Request, requested: str = "") -> str:
         """表示モードは、URL の m、Cookie（lp_m）、設定の既定値の順に決める。"""
@@ -271,7 +285,8 @@ def create_app(
             target, viewport, request.headers.get("user-agent", ""), quality, mode or page_mode(request)
         )
 
-    def result_response(result: Snapshot | NonHtml, *, embed: bool = False) -> Response:
+    def result_response(result: Snapshot | NonHtml, *, max_age: int, embed: bool = False) -> Response:
+        """max_age はスマホのブラウザにキャッシュさせる秒数。"""
         nonce = secrets.token_urlsafe(12)
         if isinstance(result, NonHtml):
             size = human(result.size) if result.size is not None else "不明"
@@ -280,7 +295,7 @@ def create_app(
         html, _ = layout.finalize(
             result, nonce, default_quality=default_quality, client_src=CLIENT_SRC, embed=embed
         )
-        return html_response(html, nonce=nonce, max_age=300, language=None, embed=embed)
+        return html_response(html, nonce=nonce, max_age=max_age, language=None, embed=embed)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -294,6 +309,15 @@ def create_app(
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     # Cloudflare 経由ならエッジでも圧縮されるが、LAN 内から直接使う場合に備えて圧縮しておく
     app.add_middleware(GZipMiddleware, minimum_size=1024)
+
+    # 届いた要求の Host を liteproxy 自身として覚え、PC 側で自分自身を開かないようにする。
+    # require_access より先に登録して内側で動かし、検証を通った要求の Host だけを覚える
+    @app.middleware("http")
+    async def learn_self_host(request: Request, call_next):
+        host = request.headers.get("host")
+        if host:
+            guard.add_self_host(host)
+        return await call_next(request)
 
     if verifier is not None:
         access = verifier
@@ -423,12 +447,25 @@ def create_app(
             if m in MODES:
                 response.set_cookie("lp_m", m, max_age=31536000, path="/", samesite="lax")
             return response
-        target = normalize_input(u)
-        if target is None:
-            if u.strip():
-                return RedirectResponse(f"/s?q={quote_plus(u.strip())}", status_code=303)
-            return RedirectResponse("/", status_code=303)
-        target = unwrap_redirector(target)
+        raw = u
+        for _ in range(SELF_UNWRAP_LIMIT):
+            target = normalize_input(raw)
+            if target is None:
+                if raw.strip():
+                    return RedirectResponse(f"/s?q={quote_plus(raw.strip())}", status_code=303)
+                return RedirectResponse("/", status_code=303)
+            target = unwrap_redirector(target)
+            if not guard.is_self(target):
+                break
+            # liteproxy 自身の URL（アドレス欄からコピーしたものなど）は、PC 側で開くと描画が
+            # 際限なく入れ子になる。中継先が書かれていればそれを開き、なければホームへ戻す
+            inner = self_inner(target)
+            if inner is None:
+                return RedirectResponse("/", status_code=303)
+            raw = inner
+        else:
+            message = "liteproxy 自身の URL が深く入れ子になっているため開けません。"
+            return html_response(templates.error_page(message, nonce), nonce=nonce, status=400, embed=embed)
         if not await guard.allowed(target):
             message = "このURLは開けません（内部ネットワーク宛て、またはブロック対象のドメインです）。"
             return html_response(templates.error_page(message, nonce), nonce=nonce, status=403, embed=embed)
@@ -437,7 +474,8 @@ def create_app(
         force = f == "1"
         cached = None if force else jobs.cached(key)
         if cached is not None:
-            return keep_mode(result_response(cached, embed=embed))
+            # 同じ URL を新たに開いたときにも使われるため、使い回す期間だけキャッシュさせる
+            return keep_mode(result_response(cached, max_age=config.cache.reuse_minutes * 60, embed=embed))
         # 描画を待たずに読み込み中画面を返し、進捗を流し続ける。完了したら /v へ移動させる。
         # no-transform は Cloudflare に圧縮・加工させず、進捗をため込まずに届けるため
         job = jobs.start(key, force=force)
@@ -458,10 +496,11 @@ def create_app(
         job = jobs.get(j)
         result = job.result if job is not None and job.key.url == target else None
         if result is None:
-            result = jobs.cached(render_key(request, target))
+            result = jobs.cached(render_key(request, target), kept=True)
         if result is None:
             return RedirectResponse(proxy_url(target), status_code=303)
-        return result_response(result, embed=is_embedded(request))
+        # /v はジョブごとに URL が変わり内容も変わらないため、保持する期間いっぱいキャッシュさせてよい
+        return result_response(result, max_age=config.cache.keep_minutes * 60, embed=is_embedded(request))
 
     @app.post("/a")
     async def act(request: Request) -> Response:

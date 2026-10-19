@@ -52,3 +52,12 @@ def test_form_target_uses_page_charset():
 
 def test_form_target_unknown_charset_falls_back_to_utf8():
     assert build_form_target("https://e.com/s", [("q", "日")], "x-unknown") == "https://e.com/s?q=%E6%97%A5"
+
+
+def test_self_inner_extracts_target_of_proxy_and_view():
+    from liteproxy.urls import self_inner
+
+    assert self_inner("https://lp.example.com/p?u=https%3A%2F%2Fexample.com%2F&m=reader") == "https://example.com/"
+    assert self_inner("https://lp.example.com/v?u=example.com&j=abc") == "example.com"
+    assert self_inner("https://lp.example.com/app") is None
+    assert self_inner("https://lp.example.com/p") is None
